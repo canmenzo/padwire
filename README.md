@@ -8,7 +8,7 @@ Keyboard and mouse as a virtual PlayStation or Xbox controller, for playing a co
 
 1. Install the [ViGEmBus](https://github.com/nefarius/ViGEmBus/releases/latest) driver.
 2. Download `padwire.exe` from [Releases](https://github.com/canmenzo/padwire/releases/latest) and run it. Or build it: `cargo build --release`.
-3. Open your Remote Play app. Veyra, chiaki-ng, PS Remote Play and the Xbox app are listed already; add any other under **Works in**.
+3. Connect to the console in your Remote Play app. Veyra, chiaki-ng, PS Remote Play and the Xbox app are listed already; add any other under **Works in**. A capture card carries only the picture: the pad reaches the console through Remote Play (in Veyra's capture view, turn on **Control the PS5 through Remote Play**).
 4. Press **F10** in the game window.
 
 In GTA 6 set look and aim acceleration to 0, sensitivity to max, aim assist off.
