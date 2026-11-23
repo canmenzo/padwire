@@ -7,7 +7,7 @@ Keyboard and mouse as a virtual PlayStation or Xbox controller, for playing a co
 ## Setup
 
 1. Install the [ViGEmBus](https://github.com/nefarius/ViGEmBus/releases/latest) driver.
-2. Build and run: `cargo build --release`, then `target\release\padwire.exe`.
+2. Download `padwire.exe` from [Releases](https://github.com/canmenzo/padwire/releases/latest) and run it. Or build it: `cargo build --release`.
 3. Open your Remote Play app. Veyra, chiaki-ng, PS Remote Play and the Xbox app are listed already; add any other under **Works in**.
 4. Press **F10** in the game window.
 
