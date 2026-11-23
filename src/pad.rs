@@ -71,7 +71,7 @@ impl Out {
             e => format!("ViGEmBus: {e:?}"),
         };
         let client = Client::connect().map_err(err)?;
-        Ok(match console {
+        let mut out = match console {
             Console::Xbox => {
                 let mut t = Xbox360Wired::new(client, TargetId::XBOX360_WIRED);
                 t.plugin().map_err(err)?;
@@ -84,7 +84,17 @@ impl Out {
                 t.wait_ready().map_err(err)?;
                 Out::Ds4(t)
             }
-        })
+        };
+        // a freshly plugged pad can refuse reports for a moment, even after wait_ready
+        let mut r = out.send(&Pad::default());
+        for _ in 0..150 {
+            if r.is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            r = out.send(&Pad::default());
+        }
+        r.map(|_| out)
     }
 
     pub fn console(&self) -> Console {

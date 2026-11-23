@@ -104,12 +104,13 @@ fn mapping(t: &mut T) {
     for target in TARGETS.iter().filter(|x| !matches!(x, LsUp | LsDown | LsLeft | LsRight | Switch)) {
         let p = Pad { buttons: target.bit(), lt: (*target == L2) as u8 as f32, rt: (*target == R2) as u8 as f32, ..Pad::default() };
         let want = xbox_report(&p);
-        let _ = out.send(&p);
-        if !until(300, || xinput(slot).is_some_and(|g| (g.wButtons, g.bLeftTrigger, g.bRightTrigger) == (want.buttons.raw, want.left_trigger, want.right_trigger))) {
+        // XInputGetState never reports the Guide button
+        let buttons = want.buttons.raw & !0x0400;
+        if !until(1000, || out.send(&p).is_ok() && xinput(slot).is_some_and(|g| (g.wButtons, g.bLeftTrigger, g.bRightTrigger) == (buttons, want.left_trigger, want.right_trigger))) {
             bad.push(*target);
         }
     }
-    t.check(bad.is_empty(), &format!("Xbox: all 18 buttons and triggers read back {bad:?}"));
+    t.check(bad.is_empty(), &format!("Xbox: buttons and triggers read back {bad:?}"));
     let p = Pad { lx: -1.0, ly: 1.0, rx: 0.5, ry: -0.5, ..Pad::default() };
     let _ = out.send(&p);
     let w = xbox_report(&p);
@@ -231,6 +232,15 @@ fn chain(t: &mut T) {
             key(ARM_VK, false);
             t.check(until(1000, || !sh.live.load(Relaxed) && !a()), "F10 turns it off and lets go of held buttons");
             key(F24, false);
+
+            wait(500);
+            key(ARM_VK, true);
+            wait(120);
+            key(ARM_VK, false);
+            t.check(until(1000, || sh.live.load(Relaxed)), "F10 turns it on with no hooks installed");
+            key(ARM_VK, true);
+            key(ARM_VK, false);
+            t.check(until(1000, || !sh.live.load(Relaxed)), "F10 turns it off again");
 
             *sh.want.lock().unwrap() = (cfg.apps.clone(), Console::Ps);
             t.check(until(5000, || xinput(slot).is_none() && ds4().is_some()), "switching console swaps the Xbox pad for a DualShock 4");

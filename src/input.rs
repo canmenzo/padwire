@@ -318,8 +318,10 @@ pub fn run(sh: Arc<Shared>) {
             if out.as_ref().map(Out::console) != Some(console) && t >= next_connect {
                 drop(out.take()); // unplug the old pad before plugging the new one
                 sent = None;
-                next_connect = t + 2.0;
                 let r = Out::connect(console);
+                if r.is_err() {
+                    next_connect = t + 2.0;
+                }
                 sh.status.lock().unwrap().error = r.as_ref().err().cloned();
                 out = r.ok();
             }
@@ -363,6 +365,7 @@ pub fn run(sh: Arc<Shared>) {
                 && let Err(e) = o.send(&pad)
             {
                 out = None;
+                next_connect = t + 2.0;
                 sh.status.lock().unwrap().error = Some(e);
             }
             sh.status.lock().unwrap().pad = pad;
