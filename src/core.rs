@@ -26,6 +26,19 @@ const FULL: f64 = 6000.0; // counts/s that mean full tilt at speed 1
 const GLIDE: f64 = 0.018;
 const STOP: f64 = 0.012;
 const PULSE: f64 = 0.07; // how long a wheel notch holds its button
+const POINT: f32 = 140.0; // mouse counts from centre to full tilt while the mouse points a stick
+const LINGER: f64 = 0.06; // a pointed stick stays put this long after its key, so a wheel pick lands
+const RESWITCH: f64 = 0.4; // a second layout switch this soon is a double tap, not a change of mind
+
+/// A stick or the triggers handed to the mouse while a key is held.
+#[derive(Clone, Copy, Default)]
+struct Pointed {
+    on: bool,
+    since: f64,
+    until: f64,
+    x: f32,
+    y: f32,
+}
 
 /// Mouse speed -> right stick tilt. The camera stops when the mouse does.
 #[derive(Default)]
@@ -85,6 +98,9 @@ pub struct Core {
     mouse: Mouse,
     steer: f32,
     combo_t: f64,
+    switched: f64,
+    /// Left stick, right stick, triggers.
+    pointed: [Pointed; 3],
 }
 
 fn compile(cfg: &Config, m: Mode) -> Vec<Option<Bind>> {
@@ -109,6 +125,8 @@ impl Core {
             mouse: Mouse::default(),
             steer: 0.0,
             combo_t: -1.0,
+            switched: -1.0,
+            pointed: [Pointed::default(); 3],
         }
     }
 
@@ -125,6 +143,7 @@ impl Core {
         self.pulse = [0.0; 2];
         self.mouse.reset();
         self.steer = 0.0;
+        self.pointed = [Pointed::default(); 3];
     }
 
     fn bind(&self, code: u16) -> Option<&Bind> {
@@ -138,6 +157,14 @@ impl Core {
     pub fn flip(&mut self) {
         self.mode = self.mode.other();
         self.latched = [false; CODES];
+    }
+
+    /// A key asked for the other layout. Double-tapping it (bailing out of a car) switches once.
+    fn switch(&mut self, now: f64) {
+        if now - self.switched > RESWITCH {
+            self.flip();
+        }
+        self.switched = now;
     }
 
     /// Key or mouse button went down. True = swallow it.
@@ -160,7 +187,7 @@ impl Core {
                 self.latched[c] = !self.latched[c];
             }
             if mask & Target::Switch.bit() != 0 {
-                self.flip();
+                self.switch(now);
             }
         }
         true
@@ -179,13 +206,23 @@ impl Core {
         }
         self.pulse[!up as usize] = now + PULSE;
         if self.bind(code).is_some_and(|b| b.to.contains(&Target::Switch)) {
-            self.flip();
+            self.switch(now);
         }
         true
     }
 
     pub fn mouse_move(&mut self, now: f64, dx: i32, dy: i32) {
-        self.mouse.ev.push_back((now, dx as f64, dy as f64));
+        // the stick (or triggers) whose key went down last gets the mouse; the others stay where they were put
+        let latest = self.pointed.iter().filter(|p| p.on).map(|p| p.since).fold(f64::MIN, f64::max);
+        if latest == f64::MIN {
+            self.mouse.ev.push_back((now, dx as f64, dy as f64));
+            return;
+        }
+        for (i, p) in self.pointed.iter_mut().enumerate().filter(|(_, p)| p.on && p.since == latest) {
+            let (x, y) = (p.x + dx as f32 / POINT, p.y - dy as f32 / POINT);
+            let len = x.hypot(y).max(1.0);
+            (p.x, p.y) = if i == 2 { (x.clamp(0.0, 1.0), y.clamp(0.0, 1.0)) } else { (x / len, y / len) };
+        }
     }
 
     pub fn tick(&mut self, now: f64, dt: f64) -> Pad {
@@ -208,6 +245,18 @@ impl Core {
             t &= !(Target::L3.bit() | Target::R3.bit());
         }
         let on = |x: Target| (t & x.bit() != 0) as i32 as f32;
+        for (p, target) in self.pointed.iter_mut().zip([Target::LsHold, Target::RsHold, Target::Triggers]) {
+            let held = t & target.bit() != 0;
+            if held && !p.on {
+                *p = Pointed { on: true, since: now, ..Pointed::default() };
+                self.mouse.ev.clear(); // the camera stops, the mouse has another job now
+            } else if !held && p.on {
+                p.on = false;
+                p.until = now + LINGER;
+            }
+        }
+        let [left, right, triggers] = self.pointed.map(|p| (p.on || now < p.until).then_some((p.x, p.y)));
+        let keys_left = t & (Target::LsUp.bit() | Target::LsDown.bit() | Target::LsLeft.bit() | Target::LsRight.bit()) != 0;
         let (mut lx, mut ly) = (on(Target::LsRight) - on(Target::LsLeft), on(Target::LsUp) - on(Target::LsDown));
         let m = lx.hypot(ly);
         if m > 0.0 {
@@ -226,19 +275,33 @@ impl Core {
         } else {
             self.steer = 0.0;
         }
-        let (rx, mut ry) = self.mouse.step(now, dt, &self.aim);
+        if let (Some(p), false) = (left, keys_left) {
+            (lx, ly) = p;
+        }
+        let (mut rx, mut ry) = self.mouse.step(now, dt, &self.aim);
         if !self.aim.invert_y {
             ry = -ry;
         }
-        let sticks = [Target::LsUp, Target::LsDown, Target::LsLeft, Target::LsRight, Target::Switch];
+        if let Some(p) = right {
+            (rx, ry) = p;
+        }
+        // keys on the right stick win over the mouse
+        let (kx, ky) = (on(Target::RsRight) - on(Target::RsLeft), on(Target::RsUp) - on(Target::RsDown));
+        let m = kx.hypot(ky);
+        if m > 0.0 {
+            (rx, ry) = (kx / m, ky / m);
+        }
+        let (tl, tr) = triggers.filter(|_| self.pointed[2].on).unwrap_or_default();
+        use Target::*;
+        let sticks = [LsUp, LsDown, LsLeft, LsRight, RsUp, RsDown, RsLeft, RsRight, LsHold, RsHold, Triggers, Switch];
         Pad {
             buttons: t & !sticks.iter().fold(0, |m, s| m | s.bit()),
             lx,
             ly,
             rx,
             ry,
-            lt: on(Target::L2),
-            rt: on(Target::R2),
+            lt: on(L2).max(tl),
+            rt: on(R2).max(tr),
         }
     }
 }
@@ -253,7 +316,7 @@ mod tests {
     const D: u16 = 0x44;
     const F: u16 = 0x46;
     const V: u16 = 0x56;
-    const J: u16 = 0x4A;
+    const U: u16 = 0x55;
     const SHIFT: u16 = 0xA0;
     const LMB: u16 = 1;
     const RMB: u16 = 2;
@@ -282,7 +345,7 @@ mod tests {
     #[test]
     fn only_swallows_what_it_owns() {
         let mut c = core();
-        assert!(!c.press(J, 0.0), "unbound key goes to the app");
+        assert!(!c.press(U, 0.0), "unbound key goes to the app");
         assert!(!c.release(W), "an up without its down is not swallowed");
         assert!(c.press(W, 0.0) && c.press(W, 0.0), "key repeat is swallowed");
         c.reset();
@@ -343,6 +406,86 @@ mod tests {
         assert!(!p.has(L3) && !p.has(R3), "both up for a moment");
         let p = c.tick(1.06, 0.001);
         assert!(p.has(L3) && p.has(R3));
+    }
+
+    #[test]
+    fn keys_on_the_right_stick_beat_the_mouse() {
+        let mut cfg = Config::default();
+        cfg.foot.insert("U".into(), Bind { to: vec![LsDown, RsDown], toggle: false });
+        let mut c = Core::new(&cfg);
+        c.mouse_move(0.0, 200, 0);
+        c.press(U, 0.0);
+        let p = c.tick(0.001, 0.001);
+        assert_eq!((p.lx, p.ly, p.rx, p.ry), (0.0, -1.0, 0.0, -1.0), "one key pulls both sticks down");
+        assert_eq!(p.buttons, 0);
+    }
+
+    const TAB: u16 = 0x09;
+    const B: u16 = 0x42;
+    const N: u16 = 0x4E;
+    const T: u16 = 0x54;
+
+    #[test]
+    fn the_mouse_points_a_stick_and_it_stays() {
+        let mut c = core();
+        c.press(TAB, 0.0);
+        let p = c.tick(0.0, 0.001);
+        assert!(p.has(L1) && (p.rx, p.ry) == (0.0, 0.0), "loadout opens, stick at rest");
+        c.mouse_move(0.001, 300, 0);
+        let p = c.tick(0.002, 0.001);
+        assert_eq!((p.rx, p.ry), (1.0, 0.0), "a flick right points the stick right");
+        for i in 0..500 {
+            assert_eq!(c.tick(0.003 + i as f64 * 0.001, 0.001).rx, 1.0, "and it stays there with the mouse still");
+        }
+        c.mouse_move(0.6, 0, -1000);
+        let p = c.tick(0.601, 0.001);
+        assert!(p.ry > 0.98 && p.rx.abs() < 0.2, "moving on slides it round the rim: ({}, {})", p.rx, p.ry);
+        c.release(TAB);
+        let p = c.tick(0.602, 0.001);
+        assert!(!p.has(L1) && p.ry > 0.98, "the stick outlasts the button for a moment, so the pick lands");
+        let p = c.tick(0.7, 0.001);
+        assert_eq!((p.rx, p.ry), (0.0, 0.0), "the camera did not collect the mouse meanwhile");
+    }
+
+    #[test]
+    fn both_sticks_can_be_set_one_after_the_other() {
+        let mut c = core();
+        c.press(B, 0.0);
+        c.tick(0.0, 0.001);
+        c.mouse_move(0.001, 300, 0);
+        c.press(N, 0.01);
+        c.tick(0.01, 0.001);
+        c.mouse_move(0.011, -300, 0);
+        let p = c.tick(0.012, 0.001);
+        assert_eq!((p.lx, p.rx), (1.0, -1.0), "hotwire: left stick right, right stick left, both held");
+        c.press(W, 0.02);
+        assert_eq!(c.tick(0.02, 0.001).ly, 1.0, "a movement key still wins on its stick");
+    }
+
+    #[test]
+    fn the_mouse_sets_trigger_pressure() {
+        let mut c = core();
+        c.press(T, 0.0);
+        c.tick(0.0, 0.001);
+        c.mouse_move(0.001, 70, -35);
+        let p = c.tick(0.002, 0.001);
+        assert!((p.lt - 0.5).abs() < 0.01 && (p.rt - 0.25).abs() < 0.01, "sideways is L2, up is R2: {} {}", p.lt, p.rt);
+        c.mouse_move(0.003, -1000, 1000);
+        assert_eq!(c.tick(0.004, 0.001).lt, 0.0);
+        c.release(T);
+        c.press(LMB, 0.01);
+        assert_eq!(c.tick(0.01, 0.001).rt, 1.0, "a plain click is still a full pull");
+    }
+
+    #[test]
+    fn a_double_tap_switches_layout_once() {
+        let mut c = core();
+        c.flip();
+        c.press(F, 5.0);
+        c.release(F);
+        c.press(F, 5.2);
+        assert_eq!(c.mode, Mode::Foot, "bailing out of a car leaves you on foot");
+        assert!(c.tick(5.2, 0.001).has(Triangle));
     }
 
     #[test]

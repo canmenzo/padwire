@@ -53,20 +53,32 @@ pub fn key_cap(code: u16) -> &'static str {
 #[serde(rename_all = "snake_case")]
 pub enum Target {
     Cross, Circle, Square, Triangle, L1, R1, L2, R2, L3, R3, Options, Share, Touchpad, Ps,
-    DUp, DDown, DLeft, DRight, LsUp, LsDown, LsLeft, LsRight,
+    DUp, DDown, DLeft, DRight, LsUp, LsDown, LsLeft, LsRight, RsUp, RsDown, RsLeft, RsRight,
+    /// While held, the mouse points the left stick and it stays where it is put.
+    LsHold,
+    /// The same for the right stick: weapon and radio wheels, lock tools, hotwiring.
+    RsHold,
+    /// While held, the mouse sets how far L2 (sideways) and R2 (up) are pressed.
+    Triggers,
     /// Switches between the on-foot and driving layouts.
     Switch,
 }
 use Target::*;
 
-pub const TARGETS: [Target; 23] = [
+pub const TARGETS: [Target; 30] = [
     Cross, Circle, Square, Triangle, L1, R1, L2, R2, L3, R3, DUp, DDown, DLeft, DRight,
-    LsUp, LsDown, LsLeft, LsRight, Options, Touchpad, Share, Ps, Switch,
+    LsUp, LsDown, LsLeft, LsRight, RsUp, RsDown, RsLeft, RsRight, Options, Touchpad, Share, Ps,
+    LsHold, RsHold, Triggers, Switch,
 ];
 
 impl Target {
     pub const fn bit(self) -> u32 {
         1 << self as u32
+    }
+
+    /// A controller button or stick direction, which takes `MAX_KEYS` keys. The rest are padwire's own modes.
+    pub fn is_button(self) -> bool {
+        !matches!(self, LsHold | RsHold | Triggers | Switch)
     }
 }
 
@@ -141,26 +153,30 @@ fn layout(binds: &[(&str, &[Target])]) -> Layout {
 
 impl Default for Config {
     fn default() -> Self {
-        // GTA 6's default PS5 scheme on GTA V's PC keys (from Rewire).
+        // GTA 6's default PS5 scheme on GTA V's PC keys. B / N / T hand a stick or the triggers to the mouse.
         let foot = layout(&[
             ("W", &[LsUp]), ("A", &[LsLeft]), ("S", &[LsDown]), ("D", &[LsRight]),
+            ("I", &[RsUp]), ("J", &[RsLeft]), ("K", &[RsDown]), ("L", &[RsRight]),
             ("Space", &[Cross]), ("LShift", &[L3]), ("LCtrl", &[Circle]),
             ("F", &[Triangle, Switch]), ("E", &[Triangle]), ("R", &[Square]),
-            ("Q", &[R1]), ("Tab", &[L1]), ("V", &[L3, R3]),
+            ("Q", &[R1]), ("Tab", &[L1, RsHold]), ("C", &[R3]), ("V", &[L3, R3]), ("G", &[DRight]),
             ("M", &[Touchpad]), ("P", &[Options]), ("Enter", &[Options]),
-            ("Up", &[DUp]), ("Down", &[DDown]), ("Left", &[DLeft]), ("Right", &[DRight]),
+            ("Up", &[DUp]), ("Down", &[DDown]), ("Left", &[DLeft, RsHold]), ("Right", &[DRight]),
             ("Z", &[DDown]), ("CapsLock", &[Switch]), ("F1", &[Ps]), ("F2", &[Share]),
-            ("LMB", &[R2]), ("RMB", &[L2]), ("MMB", &[R3]), ("Mouse4", &[L1]), ("Mouse5", &[R1]),
+            ("B", &[LsHold]), ("N", &[RsHold]), ("T", &[Triggers]),
+            ("LMB", &[R2]), ("RMB", &[L2]), ("MMB", &[DUp]), ("Mouse4", &[L1, RsHold]), ("Mouse5", &[R1]),
         ]);
         let drive = layout(&[
             ("W", &[R2]), ("S", &[L2]), ("A", &[LsLeft]), ("D", &[LsRight]),
-            ("LCtrl", &[LsDown]), ("X", &[LsUp]), ("Space", &[Cross]),
-            ("F", &[Triangle, Switch]), ("LShift", &[L3]), ("H", &[Circle]),
-            ("C", &[R3]), ("V", &[L3, R3]), ("R", &[Square]), ("Q", &[DLeft]), ("Tab", &[L1]),
+            ("LShift", &[LsUp]), ("LCtrl", &[LsDown]),
+            ("I", &[RsUp]), ("J", &[RsLeft]), ("K", &[RsDown]), ("L", &[RsRight]),
+            ("Space", &[Cross]), ("F", &[Triangle, Switch]), ("E", &[L3]), ("H", &[Circle]), ("X", &[Circle]),
+            ("R", &[Square]), ("C", &[R3]), ("Q", &[DLeft, RsHold]), ("Tab", &[L1, RsHold]),
             ("M", &[Touchpad]), ("P", &[Options]), ("Enter", &[Options]),
-            ("Up", &[DUp]), ("Down", &[DDown]), ("Left", &[DLeft]), ("Right", &[DRight]),
+            ("Up", &[DUp]), ("Down", &[DDown]), ("Left", &[DLeft, RsHold]), ("Right", &[DRight]),
             ("Z", &[DDown]), ("CapsLock", &[Switch]), ("F1", &[Ps]), ("F2", &[Share]),
-            ("LMB", &[R1]), ("RMB", &[L1]),
+            ("B", &[LsHold]), ("N", &[RsHold]), ("T", &[Triggers]),
+            ("LMB", &[R1]), ("RMB", &[L1]), ("MMB", &[DUp]), ("Mouse5", &[R1]),
         ]);
         Config {
             console: Console::Ps,
@@ -228,7 +244,7 @@ impl Config {
     fn clean(&mut self) {
         for l in [&mut self.foot, &mut self.drive] {
             l.retain(|k, _| key_code(k).is_some());
-            for t in TARGETS {
+            for t in TARGETS.into_iter().filter(|t| t.is_button()) {
                 for code in keys_on(l, t).into_iter().skip(MAX_KEYS) {
                     if let Some(b) = key_name(code).and_then(|n| l.get_mut(n)) {
                         b.to.retain(|x| *x != t);
@@ -266,10 +282,17 @@ pub fn button_name(t: Target, c: Console) -> &'static str {
         DDown => "D-pad ↓",
         DLeft => "D-pad ←",
         DRight => "D-pad →",
-        LsUp => "Stick ↑",
-        LsDown => "Stick ↓",
-        LsLeft => "Stick ←",
-        LsRight => "Stick →",
+        LsUp => "L stick ↑",
+        LsDown => "L stick ↓",
+        LsLeft => "L stick ←",
+        LsRight => "L stick →",
+        RsUp => "R stick ↑",
+        RsDown => "R stick ↓",
+        RsLeft => "R stick ←",
+        RsRight => "R stick →",
+        LsHold => "L stick by mouse",
+        RsHold => "R stick by mouse",
+        Triggers => "L2 R2 by mouse",
         Switch => "Switch layout",
     }
 }
@@ -282,6 +305,10 @@ pub fn action(t: Target, m: Mode) -> &'static str {
         LsDown => if foot { "Back" } else { "Lean back" },
         LsLeft => if foot { "Left" } else { "Steer L" },
         LsRight => if foot { "Right" } else { "Steer R" },
+        RsUp => "Look up",
+        RsDown => "Look down",
+        RsLeft => "Look left",
+        RsRight => "Look right",
         Cross => if foot { "Jump" } else { "Handbrake" },
         Circle => if foot { "Crouch" } else { "Lights" },
         Square => "Melee",
@@ -300,15 +327,18 @@ pub fn action(t: Target, m: Mode) -> &'static str {
         DRight => if foot { "Detonate" } else { "Blinker R" },
         Ps => "Home",
         Share => "Capture",
+        LsHold => "Point L",
+        RsHold => "Point R",
+        Triggers => "Triggers",
         Switch => "Switch",
     }
 }
 
 /// Short label for a key's binding in a layout.
 pub fn describe(b: &Bind, m: Mode) -> &'static str {
-    let main: Vec<Target> = b.to.iter().copied().filter(|t| *t != Switch).collect();
+    let main: Vec<Target> = b.to.iter().copied().filter(|t| t.is_button()).collect();
     match main.as_slice() {
-        [] => action(Switch, m),
+        [] => b.to.first().map_or("", |t| action(*t, m)),
         m2 if m2.contains(&L3) && m2.contains(&R3) => "Ability",
         [Triangle] if b.to.contains(&Switch) => if m == Mode::Foot { "Get in" } else { "Get out" },
         [t, ..] => action(*t, m),

@@ -101,7 +101,7 @@ fn mapping(t: &mut T) {
     t.check(slot.is_some_and(|s| !before.contains(&s)), "virtual Xbox pad shows up in XInput");
     let Some(slot) = slot else { return };
     let mut bad = Vec::new();
-    for target in TARGETS.iter().filter(|x| !matches!(x, LsUp | LsDown | LsLeft | LsRight | Switch)) {
+    for target in TARGETS.iter().filter(|x| !matches!(x, LsUp | LsDown | LsLeft | LsRight | RsUp | RsDown | RsLeft | RsRight | LsHold | RsHold | Triggers | Switch)) {
         let p = Pad { buttons: target.bit(), lt: (*target == L2) as u8 as f32, rt: (*target == R2) as u8 as f32, ..Pad::default() };
         let want = xbox_report(&p);
         // XInputGetState never reports the Guide button

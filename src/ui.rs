@@ -2,7 +2,8 @@ use crate::input::{Shared, Status, open_apps};
 use crate::model::{self, ARM_VK, Bind, Config, Console, Mode, TARGETS, Target, WHEEL_DOWN, WHEEL_UP};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Response, Sense, Stroke, StrokeKind, Vec2};
 use std::path::PathBuf;
-use std::sync::Arc;
+use crate::update::{self, Update};
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::Ordering::Relaxed;
 
 const W: f32 = 1180.0;
@@ -12,17 +13,17 @@ const DRIVER_URL: &str = "https://github.com/nefarius/ViGEmBus/releases/latest";
 const fn rgb(c: u32) -> Color32 {
     Color32::from_rgb((c >> 16) as u8, (c >> 8) as u8, c as u8)
 }
-const BG: Color32 = rgb(0x0b0b0e);
-const PANEL: Color32 = rgb(0x121217);
-const KEY: Color32 = rgb(0x1a1a21);
-const HOVER: Color32 = rgb(0x26262f);
-const EDGE: Color32 = rgb(0x23232b);
-const TEXT: Color32 = rgb(0xecebe6);
-const DIM: Color32 = rgb(0x8b8a85);
-const MUTE: Color32 = rgb(0x5a5956);
-const GREEN: Color32 = rgb(0x3ddc84);
-const AMBER: Color32 = rgb(0xffb454);
-const RED: Color32 = rgb(0xff6b6b);
+const BG: Color32 = rgb(0x0e0e0e);
+const PANEL: Color32 = rgb(0x161616);
+const KEY: Color32 = rgb(0x202020);
+const HOVER: Color32 = rgb(0x2b2b2b);
+const EDGE: Color32 = rgb(0x282828);
+const TEXT: Color32 = rgb(0xececec);
+const DIM: Color32 = rgb(0x8a8a8a);
+const MUTE: Color32 = rgb(0x5a5a5a);
+const GREEN: Color32 = rgb(0x3ecf8e);
+const AMBER: Color32 = rgb(0xe9b949);
+const RED: Color32 = rgb(0xf2706b);
 
 fn cap(code: u16) -> &'static str {
     match code {
@@ -37,9 +38,14 @@ fn cap(code: u16) -> &'static str {
     }
 }
 
-/// The keys on a controller button, as a short label: "Q M5".
+/// The keys on a controller button, as a short label: "Q M5". Modes can have more: "Tab N +2".
 fn keys_on(layout: &model::Layout, t: Target) -> String {
-    model::keys_on(layout, t).into_iter().map(cap).collect::<Vec<_>>().join(" ")
+    let codes = model::keys_on(layout, t);
+    let mut out: Vec<String> = codes.iter().take(2).map(|c| cap(*c).to_string()).collect();
+    if codes.len() > 2 {
+        out.push(format!("+{}", codes.len() - 2));
+    }
+    out.join(" ")
 }
 
 fn color(t: Target, c: Console) -> Color32 {
@@ -51,8 +57,8 @@ fn color(t: Target, c: Console) -> Color32 {
         Square => if ps { 0xf08fd6 } else { 0x4fa3ff },
         Triangle => if ps { 0x3fdcb0 } else { 0xffd23f },
         L1 | R1 => 0xc9b8ff,
-        L2 | R2 => 0xffb86b,
-        L3 | R3 | LsUp | LsDown | LsLeft | LsRight => 0xe8e4d8,
+        L2 | R2 | Triggers => 0xffb86b,
+        L3 | R3 | LsUp | LsDown | LsLeft | LsRight | RsUp | RsDown | RsLeft | RsRight | LsHold | RsHold => 0xe8e4d8,
         DUp | DDown | DLeft | DRight => 0x9fd36b,
         Options | Share | Touchpad | Ps => 0xb8b4aa,
         Switch => 0x6fa8ff,
@@ -88,7 +94,10 @@ pub struct App {
     listen: Option<(usize, Vec<bool>)>,
     /// A captured mouse press is still held: ignore it as a click.
     hold: bool,
+    /// "Reset layouts" was clicked once: a second click before this time does it.
+    reset_until: f64,
     adding: Option<Vec<String>>,
+    update: Arc<Mutex<Update>>,
     shot: Option<PathBuf>,
     frames: u32,
 }
@@ -131,6 +140,24 @@ impl Cv<'_> {
         self.text(p, a, t, size * k, c);
     }
 
+    /// A key name or a number: monospace, shrinks to fit `max` design pixels.
+    fn kbd(&self, p: Pos2, a: Align2, t: &str, size: f32, max: f32, c: Color32) {
+        let w = self.kbd_width(t, size);
+        let k = (max / w).min(1.0);
+        self.ui.painter().text(p, a, t, FontId::monospace(size * k * self.s), c);
+    }
+
+    /// Width of `kbd` text in design pixels.
+    fn kbd_width(&self, t: &str, size: f32) -> f32 {
+        self.ui.painter().layout_no_wrap(t.to_string(), FontId::monospace(size * self.s), TEXT).size().x / self.s
+    }
+
+    /// A card: one step up from the page, with a hairline.
+    fn card(&self, r: Rect) {
+        self.fill(r, 12.0, PANEL);
+        self.outline(r, 12.0, EDGE);
+    }
+
     fn hit(&self, r: Rect, id: impl std::hash::Hash + std::fmt::Debug, sense: Sense) -> Response {
         let (r, sense) = if self.active { (r, sense) } else { (Rect::NOTHING, Sense::hover()) };
         self.ui.interact(r, self.ui.scope_id().with(id), sense)
@@ -147,12 +174,14 @@ impl Cv<'_> {
     /// Two-way switch. Returns the side that was clicked.
     fn segmented(&self, r: Rect, id: &str, labels: [&str; 2], on: usize) -> Option<usize> {
         self.fill(r, 8.0, PANEL);
+        self.outline(r, 8.0, EDGE);
         let mut clicked = None;
         for (i, label) in labels.iter().enumerate() {
             let half = Rect::from_min_size(r.min + Vec2::new(i as f32 * r.width() / 2.0, 0.0), Vec2::new(r.width() / 2.0, r.height()));
             let resp = self.hit(half, (id, i), Sense::click());
             if i == on {
-                self.fill(half.shrink(3.0 * self.s), 6.0, HOVER);
+                self.fill(half.shrink(3.0 * self.s), 6.0, KEY);
+                self.outline(half.shrink(3.0 * self.s), 6.0, rgb(0x343434));
             }
             let c = if i == on || resp.hovered() { TEXT } else { DIM };
             self.text(half.center(), Align2::CENTER_CENTER, label, 13.0, c);
@@ -166,7 +195,7 @@ impl Cv<'_> {
     fn slider(&self, r: Rect, id: &str, label: &str, v: &mut f32, lo: f32, hi: f32) -> bool {
         let s = self.s;
         self.text(r.left_center(), Align2::LEFT_CENTER, label, 13.0, TEXT);
-        self.text(r.right_center(), Align2::RIGHT_CENTER, &format!("{v:.2}"), 13.0, DIM);
+        self.kbd(r.right_center(), Align2::RIGHT_CENTER, &format!("{v:.2}"), 12.0, 44.0, DIM);
         let track = Rect::from_min_max(
             Pos2::new(r.left() + 120.0 * s, r.center().y - 2.0 * s),
             Pos2::new(r.right() - 48.0 * s, r.center().y + 2.0 * s),
@@ -206,7 +235,7 @@ impl Cv<'_> {
 
 impl App {
     pub fn new(sh: Arc<Shared>, cfg: Config, path: PathBuf) -> App {
-        App { sh, cfg, path, pick: None, pad: false, btn: None, listen: None, hold: false, adding: None, shot: None, frames: 0 }
+        App { sh, cfg, path, pick: None, pad: false, btn: None, listen: None, hold: false, reset_until: 0.0, adding: None, update: Arc::default(), shot: None, frames: 0 }
     }
 
     /// Off-screen check: open a view or picker, save frame 8 to `shot`, close.
@@ -215,6 +244,14 @@ impl App {
         self.pick = pick;
         self.pad = pad || popup;
         self.btn = popup.then_some(Target::Cross);
+        self
+    }
+
+    /// Looks for a newer release once at start (not in off-screen checks).
+    pub fn check_update(self, yes: bool) -> App {
+        if yes {
+            update::check(&self.update);
+        }
         self
     }
 
@@ -228,11 +265,15 @@ impl App {
         let s = cv.s;
         let bind = model::key_name(code).and_then(|n| self.cfg.layout(mode).get(n));
         let resp = cv.hit(r, ("key", code), Sense::click());
-        cv.fill(r, 7.0, if resp.hovered() || self.pick == Some(code) { HOVER } else { KEY });
+        let hot = resp.hovered() || self.pick == Some(code);
+        if hot || bind.is_some() {
+            cv.fill(r, 7.0, if hot { HOVER } else { KEY });
+        }
+        cv.outline(r, 7.0, EDGE);
         let cap = model::key_cap(code);
         if let Some(b) = bind {
-            let c = color(b.to.iter().copied().find(|t| *t != Target::Switch).unwrap_or(Target::Switch), self.cfg.console);
-            cv.text(r.min + Vec2::new(6.0, 4.0) * s, Align2::LEFT_TOP, cap, 10.0, DIM);
+            let c = color(b.to.iter().copied().find(|t| t.is_button()).unwrap_or(b.to[0]), self.cfg.console);
+            cv.kbd(r.min + Vec2::new(6.0, 5.0) * s, Align2::LEFT_TOP, cap, 9.5, 40.0, DIM);
             let label = model::describe(b, mode);
             cv.fit(Pos2::new(r.center().x, r.bottom() - 9.0 * s), Align2::CENTER_BOTTOM, label, 11.5, r.width() / s - 6.0, TEXT);
             cv.fill(Rect::from_min_max(Pos2::new(r.left() + 7.0 * s, r.bottom() - 5.0 * s), Pos2::new(r.right() - 7.0 * s, r.bottom() - 3.0 * s)), 1.0, c);
@@ -240,7 +281,7 @@ impl App {
                 cv.ui.painter().circle_filled(r.right_top() + Vec2::new(-8.0, 8.0) * s, 3.0 * s, c);
             }
         } else {
-            cv.text(r.min + Vec2::new(6.0, 4.0) * s, Align2::LEFT_TOP, cap, 10.0, MUTE);
+            cv.kbd(r.min + Vec2::new(6.0, 5.0) * s, Align2::LEFT_TOP, cap, 9.5, 40.0, MUTE);
         }
         if resp.clicked() {
             self.pick = Some(code);
@@ -261,11 +302,11 @@ impl App {
                 x += w * U;
                 if code == ARM_VK {
                     cv.outline(r, 7.0, EDGE);
-                    cv.text(r.min + Vec2::new(6.0, 4.0) * cv.s, Align2::LEFT_TOP, "F10", 10.0, DIM);
+                    cv.kbd(r.min + Vec2::new(6.0, 5.0) * cv.s, Align2::LEFT_TOP, "F10", 9.5, 40.0, DIM);
                     cv.text(Pos2::new(r.center().x, r.bottom() - 9.0 * cv.s), Align2::CENTER_BOTTOM, "On/off", 11.5, DIM);
                 } else if code == 0 {
                     cv.outline(r, 7.0, EDGE);
-                    cv.text(r.min + Vec2::new(6.0, 4.0) * cv.s, Align2::LEFT_TOP, LEFT_ALONE[alone], 10.0, MUTE);
+                    cv.kbd(r.min + Vec2::new(6.0, 5.0) * cv.s, Align2::LEFT_TOP, LEFT_ALONE[alone], 9.5, 40.0, MUTE);
                     alone += 1;
                 } else {
                     self.key(cv, r, code, mode);
@@ -316,7 +357,7 @@ impl App {
             match dirs {
                 Some(dirs) => {
                     for (t, d) in dirs.into_iter().zip([Vec2::new(0.0, -1.0), Vec2::new(0.0, 1.0), Vec2::new(-1.0, 0.0), Vec2::new(1.0, 0.0)]) {
-                        cv.fit(c + d * 22.0 * s, Align2::CENTER_CENTER, &keys(t), 11.0, 24.0, if p.has(t) { TEXT } else { DIM });
+                        cv.kbd(c + d * 22.0 * s, Align2::CENTER_CENTER, &keys(t), 10.5, 24.0, if p.has(t) { TEXT } else { DIM });
                     }
                 }
                 None => {
@@ -342,7 +383,7 @@ impl App {
                 let name = model::button_name(t, con).trim_start_matches("D-pad ");
                 let size = if matches!(t, Cross | Circle | Square | Triangle) && con == Console::Ps { 13.0 } else { 10.0 };
                 cv.fit(Pos2::new(r.center().x, r.top() + 11.0 * s), Align2::CENTER_CENTER, name, size, 57.0, if on { BG } else { c });
-                cv.fit(Pos2::new(r.center().x, r.bottom() - 11.0 * s), Align2::CENTER_CENTER, &keys(t), 12.0, 57.0, if on { BG } else { TEXT });
+                cv.kbd(Pos2::new(r.center().x, r.bottom() - 11.0 * s), Align2::CENTER_CENTER, &keys(t), 11.0, 57.0, if on { BG } else { TEXT });
             }
         }
     }
@@ -398,7 +439,7 @@ impl App {
         let Some(name) = model::key_name(code) else { return };
         let back = cv.hit(full, "backdrop", Sense::click());
         cv.ui.painter().rect_filled(full, 0.0, Color32::from_black_alpha(170));
-        let (pw, ph) = (576.0, 396.0);
+        let (pw, ph) = (576.0, 488.0);
         let (px, py) = ((W - pw) / 2.0, (H - ph) / 2.0);
         let panel = cv.r(px, py, pw, ph);
         cv.hit(panel, "panel", Sense::click());
@@ -412,16 +453,16 @@ impl App {
             let r = cv.r(px + 22.0 + (i % 4) as f32 * 134.0, py + 56.0 + (i / 4) as f32 * 46.0, 128.0, 40.0);
             let resp = cv.hit(r, ("target", i), Sense::click());
             let on = bind.to.contains(&t);
-            let full = !on && model::keys_on(self.cfg.layout(mode), t).len() >= model::MAX_KEYS;
+            let full = !on && t.is_button() && model::keys_on(self.cfg.layout(mode), t).len() >= model::MAX_KEYS;
             let c = if full { MUTE } else { color(t, self.cfg.console) };
             cv.fill(r, 8.0, if on || resp.hovered() && !full { HOVER } else { KEY });
             if on {
                 cv.outline(r, 8.0, c);
             }
             let face = self.cfg.console == Console::Ps && matches!(t, Target::Cross | Target::Circle | Target::Square | Target::Triangle);
-            let room = if t == Target::Switch { 108.0 } else { 62.0 };
+            let room = if t.is_button() { 62.0 } else { 108.0 };
             cv.fit(r.left_center() + Vec2::new(10.0 * s, 0.0), Align2::LEFT_CENTER, model::button_name(t, self.cfg.console), if face { 18.0 } else { 13.0 }, room, c);
-            if t != Target::Switch {
+            if t.is_button() {
                 cv.fit(r.right_center() - Vec2::new(8.0 * s, 0.0), Align2::RIGHT_CENTER, model::action(t, mode), 11.0, 52.0, DIM);
             }
             if resp.clicked() && !full {
@@ -449,9 +490,9 @@ impl App {
     }
 }
 
-const SHELL: Color32 = rgb(0x22222a);
-const CAP: Color32 = rgb(0x0e0e12);
-const LEAD: Color32 = rgb(0x3a3a44);
+const SHELL: Color32 = rgb(0x262626);
+const CAP: Color32 = rgb(0x101010);
+const LEAD: Color32 = rgb(0x3c3c3c);
 
 /// The controller's outline, seen from the front or the back.
 fn shell(v: &Cv) {
@@ -487,14 +528,13 @@ impl App {
         let chip = |v: &Cv, t: Target, x: f32, y: f32, a: Align2, w: Option<f32>| {
             let k = keys_on(layout, t);
             let text = if k.is_empty() { "+" } else { k.as_str() };
-            let font = FontId::proportional(11.5 * v.s);
-            let fit = v.ui.painter().layout_no_wrap(text.to_string(), font, TEXT).size().x / v.s + 16.0;
-            let w = w.unwrap_or(fit.max(30.0));
+            let w = w.unwrap_or((v.kbd_width(text, 11.0) + 16.0).max(30.0));
             let r = a.anchor_size(v.p(x, y), Vec2::new(w, 22.0) * v.s);
             let hov = hit(v, t, r, 1);
             v.fill(r, 6.0, if hov { HOVER } else { KEY });
+            v.outline(r, 6.0, rgb(0x303030));
             let c = if on(t) { color(t, con) } else if k.is_empty() { MUTE } else { TEXT };
-            v.fit(r.center(), Align2::CENTER_CENTER, text, 11.5, w - 6.0, c);
+            v.kbd(r.center(), Align2::CENTER_CENTER, text, 11.0, w - 6.0, c);
         };
         let lead = |v: &Cv, pts: &[(f32, f32)]| {
             for w in pts.windows(2) {
@@ -502,14 +542,14 @@ impl App {
             }
         };
         let y0 = 124.0;
-        for (x, w, name) in [(24.0, 580.0, "Front"), (620.0, 260.0, "Top"), (896.0, 260.0, "Back")] {
-            cv.fill(cv.r(x, y0, w, 322.0), 12.0, PANEL);
+        for (x, w, name) in [(24.0, 620.0, "Front"), (660.0, 240.0, "Top"), (916.0, 240.0, "Back")] {
+            cv.card(cv.r(x, y0, w, 322.0));
             cv.text(cv.p(x + 18.0, y0 + 14.0), Align2::LEFT_TOP, name, 12.0, DIM);
         }
         let at = |x: f32, y: f32, k: f32| Cv { ui: cv.ui, o: cv.p(x, y), s: cv.s * k, active: cv.active };
 
         // front
-        let v = at(24.0 + 290.0 - 266.5 * 1.08, y0 + 167.0 - 164.5 * 1.08, 1.08);
+        let v = at(24.0 + 310.0 - 290.5 * 1.08, y0 + 167.0 - 164.5 * 1.08, 1.08);
         shell(&v);
         lead(&v, &[(224.0, 64.0), (224.0, 40.0), (124.0, 40.0)]);
         lead(&v, &[(356.0, 64.0), (356.0, 40.0), (456.0, 40.0)]);
@@ -522,7 +562,7 @@ impl App {
         lead(&v, &[(396.0, 137.0), (456.0, 137.0)]);
         lead(&v, &[(361.0, 122.0), (361.0, 158.0), (456.0, 158.0)]);
         lead(&v, &[(221.0, 180.0), (136.0, 180.0), (136.0, 240.0), (121.0, 240.0)]);
-        lead(&v, &[(359.0, 180.0), (444.0, 180.0), (444.0, 240.0), (456.0, 240.0)]);
+        lead(&v, &[(359.0, 180.0), (444.0, 180.0), (444.0, 240.0), (459.0, 240.0)]);
         lead(&v, &[(244.0, 195.0), (244.0, 204.0)]);
         lead(&v, &[(336.0, 195.0), (336.0, 204.0)]);
         lead(&v, &[(290.0, 180.0), (290.0, 240.0)]);
@@ -549,13 +589,13 @@ impl App {
                 v.outline(r, 12.0, color(Touchpad, con));
             }
             let k = keys_on(layout, Touchpad);
-            v.fit(r.center(), Align2::CENTER_CENTER, if k.is_empty() { "+" } else { &k }, 12.0, 96.0, if k.is_empty() { MUTE } else { TEXT });
+            v.kbd(r.center(), Align2::CENTER_CENTER, if k.is_empty() { "+" } else { &k }, 11.5, 96.0, if k.is_empty() { MUTE } else { TEXT });
         }
         for (t, x, sx, sy) in [(L3, 244.0, p.lx, p.ly), (R3, 336.0, p.rx, p.ry)] {
             let c = v.p(x, 172.0);
             let hov = hit(&v, t, Rect::from_center_size(c, Vec2::splat(46.0 * v.s)), 0);
             v.ui.painter().circle_filled(c, 23.0 * v.s, face(t, hov));
-            v.ui.painter().circle_filled(c + Vec2::new(sx, -sy) * 7.0 * v.s, 14.0 * v.s, rgb(0x2c2c36));
+            v.ui.painter().circle_filled(c + Vec2::new(sx, -sy) * 7.0 * v.s, 14.0 * v.s, rgb(0x343434));
         }
         let c = v.p(290.0, 172.0);
         let hov = hit(&v, Ps, Rect::from_center_size(c, Vec2::splat(20.0 * v.s)), 0);
@@ -566,44 +606,51 @@ impl App {
         for (t, y) in [(Options, 40.0), (Triangle, 87.0), (Circle, 112.0), (Cross, 137.0), (Square, 158.0)] {
             chip(&v, t, 460.0, y, Align2::LEFT_CENTER, None);
         }
-        for (t, x, y) in [(LsUp, 66.0, 214.0), (LsLeft, 30.0, 240.0), (LsDown, 66.0, 240.0), (LsRight, 102.0, 240.0)] {
-            chip(&v, t, x, y, Align2::CENTER_CENTER, Some(34.0));
+        for (ts, x) in [([LsUp, LsLeft, LsDown, LsRight], 66.0), ([RsUp, RsLeft, RsDown, RsRight], 514.0)] {
+            for (t, dx, y) in [(ts[0], 0.0, 214.0), (ts[1], -36.0, 240.0), (ts[2], 0.0, 240.0), (ts[3], 36.0, 240.0)] {
+                chip(&v, t, x + dx, y, Align2::CENTER_CENTER, Some(34.0));
+            }
         }
-        let r = Align2::LEFT_CENTER.anchor_size(v.p(460.0, 240.0), Vec2::new(54.0, 22.0) * v.s);
-        v.fill(r, 6.0, KEY);
-        v.text(r.center(), Align2::CENTER_CENTER, "Mouse", 11.5, DIM);
+        // hold one of these and the mouse points that stick
+        for (t, x) in [(LsHold, 66.0), (RsHold, 514.0)] {
+            v.text(v.p(x - 53.0, 270.0), Align2::LEFT_CENTER, "Mouse", 10.5, DIM);
+            chip(&v, t, x + 53.0, 270.0, Align2::RIGHT_CENTER, None);
+        }
         chip(&v, L3, 244.0, 215.0, Align2::CENTER_CENTER, None);
         chip(&v, R3, 336.0, 215.0, Align2::CENTER_CENTER, None);
         chip(&v, Ps, 290.0, 251.0, Align2::CENTER_CENTER, None);
 
         // top: the shoulder buttons
-        let v = at(620.0, y0, 1.0);
-        v.fill(v.r(14.0, 138.0, 232.0, 76.0), 26.0, SHELL);
-        for (trigger, bumper, x) in [(L2, L1, 22.0), (R2, R1, 142.0)] {
+        let v = at(660.0, y0, 1.0);
+        v.fill(v.r(10.0, 138.0, 220.0, 76.0), 26.0, SHELL);
+        for (trigger, bumper, x) in [(L2, L1, 16.0), (R2, R1, 128.0)] {
             for (t, y, h) in [(trigger, 96.0, 50.0), (bumper, 160.0, 34.0)] {
                 let r = v.r(x, y, 96.0, h);
                 let hov = hit(&v, t, r, 0);
-                v.fill(r, 10.0, if on(t) { color(t, con) } else if hov { HOVER } else { rgb(0x2a2a33) });
+                v.fill(r, 10.0, if on(t) { color(t, con) } else if hov { HOVER } else { rgb(0x303030) });
                 let k = keys_on(layout, t);
                 let (text, c) = if k.is_empty() { ("+", MUTE) } else { (k.as_str(), if on(t) { BG } else { TEXT }) };
                 let name = model::button_name(t, con);
                 if t == trigger {
                     v.text(Pos2::new(r.center().x, r.top() + 14.0 * v.s), Align2::CENTER_CENTER, name, 11.0, ink(t));
-                    v.fit(Pos2::new(r.center().x, r.bottom() - 16.0 * v.s), Align2::CENTER_CENTER, text, 12.5, 86.0, c);
+                    v.kbd(Pos2::new(r.center().x, r.bottom() - 16.0 * v.s), Align2::CENTER_CENTER, text, 12.0, 86.0, c);
                 } else {
                     v.text(r.left_center() + Vec2::new(12.0 * v.s, 0.0), Align2::LEFT_CENTER, name, 11.0, ink(t));
-                    v.fit(r.right_center() - Vec2::new(12.0 * v.s, 0.0), Align2::RIGHT_CENTER, text, 12.5, 52.0, c);
+                    v.kbd(r.right_center() - Vec2::new(12.0 * v.s, 0.0), Align2::RIGHT_CENTER, text, 12.0, 52.0, c);
                 }
             }
         }
 
+        v.text(v.p(16.0, 250.0), Align2::LEFT_CENTER, "Pressure by mouse", 10.5, DIM);
+        chip(&v, Triggers, 224.0, 250.0, Align2::RIGHT_CENTER, None);
+
         // back: the triggers, mirrored
-        shell(&at(896.0 + 130.0 - 290.0 * 0.62, y0 + 60.0, 0.62));
-        let v = at(896.0, y0, 1.0);
-        for (t, x) in [(R2, 44.0), (L2, 152.0)] {
+        shell(&at(916.0 + 120.0 - 290.0 * 0.62, y0 + 60.0, 0.62));
+        let v = at(916.0, y0, 1.0);
+        for (t, x) in [(R2, 34.0), (L2, 142.0)] {
             let r = v.r(x, 82.0, 64.0, 30.0);
             let hov = hit(&v, t, r, 2);
-            v.fill(r, 10.0, if on(t) { color(t, con) } else if hov { HOVER } else { rgb(0x2a2a33) });
+            v.fill(r, 10.0, if on(t) { color(t, con) } else if hov { HOVER } else { rgb(0x303030) });
             v.text(r.center(), Align2::CENTER_CENTER, model::button_name(t, con), 11.0, ink(t));
             lead(&v, &[(x + 32.0, 82.0), (x + 32.0, 70.0)]);
             chip(&v, t, x + 32.0, 58.0, Align2::CENTER_CENTER, None);
@@ -648,7 +695,9 @@ impl App {
         let s = cv.s;
         let back = cv.hit(full, "backdrop2", Sense::click());
         cv.ui.painter().rect_filled(full, 0.0, Color32::from_black_alpha(170));
-        let (pw, ph) = (420.0, 236.0);
+        let codes = model::keys_on(self.cfg.layout(mode), t);
+        let slots = if t.is_button() { model::MAX_KEYS } else { (codes.len() + 1).min(6) };
+        let (pw, ph) = (420.0, 140.0 + slots as f32 * 48.0);
         let (px, py) = ((W - pw) / 2.0, (H - ph) / 2.0);
         let panel = cv.r(px, py, pw, ph);
         cv.hit(panel, "panel2", Sense::click());
@@ -656,11 +705,11 @@ impl App {
         cv.outline(panel, 12.0, EDGE);
         let con = self.cfg.console;
         let name = model::button_name(t, con);
-        let title = format!("{name}  ·  {}  ·  {}", model::action(t, mode), if mode == Mode::Foot { "On foot" } else { "Driving" });
+        let layout = if mode == Mode::Foot { "On foot" } else { "Driving" };
+        let title = if t.is_button() { format!("{name}  ·  {}  ·  {layout}", model::action(t, mode)) } else { format!("{name}  ·  {layout}") };
         cv.text(cv.p(px + 22.0, py + 18.0), Align2::LEFT_TOP, &title, 16.0, TEXT);
-        let codes = model::keys_on(self.cfg.layout(mode), t);
         let (mut start, mut clear) = (None, None);
-        for i in 0..model::MAX_KEYS {
+        for i in 0..slots {
             let r = cv.r(px + 22.0, py + 58.0 + i as f32 * 48.0, pw - 44.0, 40.0);
             let code = codes.get(i).copied();
             let hear = self.listen.as_ref().is_some_and(|l| l.0 == i);
@@ -671,7 +720,7 @@ impl App {
                 cv.outline(r, 8.0, AMBER);
                 cv.text(left, Align2::LEFT_CENTER, "Press a key or mouse button", 13.0, AMBER);
             } else if let Some(code) = code {
-                cv.text(left, Align2::LEFT_CENTER, cap(code), 14.0, TEXT);
+                cv.kbd(left, Align2::LEFT_CENTER, cap(code), 13.5, 300.0, TEXT);
                 let xr = Rect::from_min_max(Pos2::new(r.right() - 40.0 * s, r.top()), r.max);
                 let x = cv.hit(xr, ("slot-x", i), Sense::click());
                 cv.text(xr.center(), Align2::CENTER_CENTER, "✕", 11.0, if x.hovered() { RED } else { MUTE });
@@ -720,15 +769,19 @@ fn key_down(code: u16) -> bool {
     DOWN.get() == code
 }
 
-/// Segoe UI for text, Segoe UI Symbol for the button glyphs.
+/// Segoe UI for text, Consolas for key names and numbers, Segoe UI Symbol for the button glyphs.
 pub fn fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     let dir = std::env::var("WINDIR").unwrap_or_else(|_| "C:/Windows".into());
-    for (name, file, front) in [("segoe", "segoeui.ttf", true), ("symbols", "seguisym.ttf", false)] {
+    use egui::FontFamily::{Monospace, Proportional};
+    // (name, file, family it leads). Every font is also a fallback in both families, for arrows and glyphs.
+    for (name, file, lead) in [("segoe", "segoeui.ttf", Some(Proportional)), ("mono", "consola.ttf", Some(Monospace)), ("symbols", "seguisym.ttf", None)] {
         if let Ok(bytes) = std::fs::read(format!("{dir}/Fonts/{file}")) {
             fonts.font_data.insert(name.into(), Arc::new(egui::FontData::from_owned(bytes)));
-            let fam = fonts.families.entry(egui::FontFamily::Proportional).or_default();
-            if front { fam.insert(0, name.into()) } else { fam.push(name.into()) }
+            for fam in [Proportional, Monospace] {
+                let list = fonts.families.entry(fam.clone()).or_default();
+                if lead.as_ref() == Some(&fam) { list.insert(0, name.into()) } else { list.push(name.into()) }
+            }
         }
     }
     ctx.set_fonts(fonts);
@@ -779,11 +832,33 @@ impl App {
                 core.flip();
             }
         }
-        if cv.button(cv.r(W - 24.0 - 130.0, 80.0, 130.0, 30.0), "reset", "Reset layouts", DIM, BG) {
-            let d = Config::default();
-            self.cfg.foot = d.foot;
-            self.cfg.drive = d.drive;
-            self.changed();
+        let state = self.update.lock().unwrap().clone();
+        let (label, fg) = match &state {
+            Update::Unknown => (format!("v{}  ·  Check for updates", update::VERSION), DIM),
+            Update::Checking => ("Checking for updates".to_string(), MUTE),
+            Update::Current => (format!("v{}  ·  Up to date", update::VERSION), DIM),
+            Update::Newer(tag) => (format!("Get {tag}"), GREEN),
+            Update::Failed => ("Update check failed  ·  Retry".to_string(), DIM),
+        };
+        if cv.button(cv.r(W - 24.0 - 130.0 - 8.0 - 200.0, 80.0, 200.0, 30.0), "update", &label, fg, BG) {
+            match state {
+                Update::Newer(_) => cv.ui.ctx().open_url(egui::OpenUrl::new_tab(update::PAGE)),
+                Update::Checking => {}
+                _ => update::check(&self.update),
+            }
+        }
+        let now = cv.ui.input(|i| i.time);
+        let sure = now < self.reset_until;
+        if cv.button(cv.r(W - 24.0 - 130.0, 80.0, 130.0, 30.0), "reset", if sure { "Click again" } else { "Reset layouts" }, if sure { RED } else { DIM }, BG) {
+            if sure {
+                let d = Config::default();
+                self.cfg.foot = d.foot;
+                self.cfg.drive = d.drive;
+                self.changed();
+                self.reset_until = 0.0;
+            } else {
+                self.reset_until = now + 3.0;
+            }
         }
         let hint = if self.pad { "Click a button to change its keys" } else { "Click a key to change it" };
         cv.text(cv.p(498.0, 95.0), Align2::LEFT_CENTER, hint, 12.0, MUTE);
@@ -797,7 +872,7 @@ impl App {
         let (cy, ch) = (462.0, 214.0);
         let cards = [(24.0, 372.0), (412.0, 468.0), (896.0, 260.0)];
         for (x, w) in cards {
-            cv.fill(cv.r(x, cy, w, ch), 12.0, PANEL);
+            cv.card(cv.r(x, cy, w, ch));
         }
         self.aim_card(&cv, cards[0].0, cy, cards[0].1);
         self.apps_card(&cv, cards[2].0, cy, cards[2].1, &st, live);
@@ -849,6 +924,8 @@ mod tests {
         ctx: egui::Context,
         app: App,
         t: f64,
+        /// The last web page the UI asked the system to open.
+        opened: Option<String>,
     }
 
     impl Rig {
@@ -856,7 +933,7 @@ mod tests {
             let path = std::env::temp_dir().join(format!("padwire-ui-{}-{name}.json", std::process::id()));
             let cfg = Config::default();
             let sh = Shared::new(Core::new(&cfg), cfg.apps.clone(), cfg.console);
-            let mut rig = Rig { ctx: egui::Context::default(), app: App::new(sh, cfg, path), t: 0.0 };
+            let mut rig = Rig { ctx: egui::Context::default(), app: App::new(sh, cfg, path), t: 0.0, opened: None };
             rig.frame(vec![]);
             rig
         }
@@ -870,7 +947,13 @@ mod tests {
                 ..Default::default()
             };
             let app = &mut self.app;
-            self.ctx.run_ui(input, |ui| app.draw(ui)).textures_delta.clear();
+            let mut out = self.ctx.run_ui(input, |ui| app.draw(ui));
+            out.textures_delta.clear();
+            for c in out.platform_output.commands {
+                if let egui::OutputCommand::OpenUrl(o) = c {
+                    self.opened = Some(o.url);
+                }
+            }
         }
 
         fn button(&mut self, x: f32, y: f32, pressed: bool) {
@@ -897,30 +980,30 @@ mod tests {
     }
 
     const KEY_W: (f32, f32) = (183.0, 256.0);
-    const KEY_J: (f32, f32) = (444.0, 310.0);
-    const CHIP_CROSS: (f32, f32) = (388.0, 228.0);
-    const CHIP_SQUARE: (f32, f32) = (656.0, 228.0);
-    const HOLD: (f32, f32) = (419.0, 512.0);
-    const CLEAR: (f32, f32) = (711.0, 512.0);
-    const DONE: (f32, f32) = (811.0, 512.0);
+    const KEY_U: (f32, f32) = (453.0, 256.0);
+    const CHIP_CROSS: (f32, f32) = (388.0, 182.0);
+    const CHIP_SQUARE: (f32, f32) = (656.0, 182.0);
+    const HOLD: (f32, f32) = (419.0, 558.0);
+    const CLEAR: (f32, f32) = (711.0, 558.0);
+    const DONE: (f32, f32) = (811.0, 558.0);
 
     #[test]
     fn rebinding_a_key() {
         let mut r = Rig::new("rebind");
-        r.click(KEY_J.0, KEY_J.1);
-        assert_eq!(r.app.pick, Some(0x4A), "clicking J opens its picker");
+        r.click(KEY_U.0, KEY_U.1);
+        assert_eq!(r.app.pick, Some(0x55), "clicking U opens its picker");
         r.click(CHIP_CROSS.0, CHIP_CROSS.1);
         r.click(CHIP_SQUARE.0, CHIP_SQUARE.1);
         r.click(HOLD.0, HOLD.1);
         r.click(DONE.0, DONE.1);
         assert_eq!(r.app.pick, None);
         let want = Bind { to: vec![Cross, Square], toggle: true };
-        assert_eq!(r.app.cfg.foot["J"], want);
-        assert_eq!(r.saved().foot["J"], want, "written to disk");
-        assert_eq!(r.saved().drive.get("J"), None, "only the layout on screen changes");
-        // the running engine got it too: J now latches Cross + Square
+        assert_eq!(r.app.cfg.foot["U"], want);
+        assert_eq!(r.saved().foot["U"], want, "written to disk");
+        assert_eq!(r.saved().drive.get("U"), None, "only the layout on screen changes");
+        // the running engine got it too: U now latches Cross + Square
         let mut core = r.app.sh.core.lock().unwrap();
-        assert!(core.press(0x4A, 0.0));
+        assert!(core.press(0x55, 0.0));
         let pad = core.tick(0.0, 0.001);
         assert!(pad.has(Cross) && pad.has(Square));
     }
@@ -956,7 +1039,17 @@ mod tests {
         assert!(!r.app.sh.armed.load(Relaxed));
         r.app.cfg.foot.clear();
         r.click(1091.0, 95.0);
+        assert!(r.app.cfg.foot.is_empty(), "the first click only asks");
+        r.click(1091.0, 95.0);
         assert_eq!(r.app.cfg.foot, Config::default().foot, "reset layouts");
+    }
+
+    #[test]
+    fn a_newer_release_becomes_a_download_button() {
+        let mut r = Rig::new("update");
+        *r.app.update.lock().unwrap() = Update::Newer("v9.9.9".into());
+        r.click(918.0, 95.0);
+        assert_eq!(r.opened.as_deref(), Some(update::PAGE), "it opens the release page and downloads nothing itself");
     }
 
     #[test]
@@ -1006,21 +1099,21 @@ mod tests {
         let mut r = Rig::new("padview");
         r.click(189.0, 95.0);
         assert!(r.app.pad, "the Controller tab opens the controller view");
-        r.click(441.0, 261.0);
+        r.click(435.0, 261.0);
         assert_eq!(r.app.btn, Some(Cross), "clicking the drawn button opens its keys");
         r.click(560.0, 358.0);
         assert_eq!(r.app.listen.as_ref().map(|l| l.0), Some(1), "the empty slot waits for a key");
-        DOWN.set(0x4A);
+        DOWN.set(0x55);
         r.frame(vec![]);
         DOWN.set(0);
-        assert_eq!(r.app.listen, None, "pressing J fills the slot");
-        assert_eq!(model::keys_on(&r.app.cfg.foot, Cross), [0x4A, 0x20], "J joins Space");
-        assert_eq!(r.saved().foot["J"], Bind { to: vec![Cross], toggle: false });
+        assert_eq!(r.app.listen, None, "pressing U fills the slot");
+        assert_eq!(model::keys_on(&r.app.cfg.foot, Cross), [0x55, 0x20], "U joins Space");
+        assert_eq!(r.saved().foot["U"], Bind { to: vec![Cross], toggle: false });
         // a key that was on another button moves over
         r.click(560.0, 310.0);
         r.app.capture(Cross, Mode::Foot, 0x51);
         r.frame(vec![]);
-        assert_eq!(model::keys_on(&r.app.cfg.foot, Cross), [0x51, 0x20], "Q replaces J in slot one");
+        assert_eq!(model::keys_on(&r.app.cfg.foot, Cross), [0x51, 0x20], "Q replaces U in slot one");
         assert_eq!(model::keys_on(&r.app.cfg.foot, R1), [0x06], "Q left R1");
         // the cross takes a key off
         r.click(760.0, 310.0);
@@ -1043,7 +1136,7 @@ mod tests {
         r.click(733.0, 434.0);
         assert_eq!(r.app.btn, None, "Done closes it");
         // the label next to a button opens the same thing
-        r.click(140.0, 209.0);
+        r.click(134.0, 209.0);
         assert_eq!(r.app.btn, Some(DUp));
     }
 
@@ -1051,17 +1144,17 @@ mod tests {
     fn a_button_takes_two_keys_at_most() {
         let d = Config::default();
         for (name, l) in [("foot", &d.foot), ("drive", &d.drive)] {
-            for t in TARGETS {
+            for t in TARGETS.into_iter().filter(|t| t.is_button()) {
                 assert!(model::keys_on(l, t).len() <= model::MAX_KEYS, "{name} {t:?}");
             }
         }
         // the key picker refuses a third key: Triangle already has E and F
         let mut r = Rig::new("max");
-        r.click(KEY_J.0, KEY_J.1);
-        r.click(790.0, 228.0);
-        assert_eq!(r.app.cfg.foot.get("J"), None);
+        r.click(KEY_U.0, KEY_U.1);
+        r.click(790.0, 182.0);
+        assert_eq!(r.app.cfg.foot.get("U"), None);
         // a config file with three is trimmed on load
-        r.app.cfg.foot.insert("J".into(), Bind { to: vec![Triangle], toggle: false });
+        r.app.cfg.foot.insert("U".into(), Bind { to: vec![Triangle], toggle: false });
         r.app.cfg.save(&r.app.path);
         assert_eq!(model::keys_on(&r.saved().foot, Triangle).len(), 2);
     }

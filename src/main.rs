@@ -5,6 +5,7 @@ mod model;
 mod pad;
 mod selftest;
 mod ui;
+mod update;
 
 use eframe::egui;
 use std::path::PathBuf;
@@ -50,12 +51,13 @@ fn main() {
         viewport = viewport.with_position([-30000.0, -30000.0]).with_taskbar(false).with_active(false);
     }
     let app_sh = sh.clone();
+    let live_run = shot.is_none();
     let _ = eframe::run_native(
         "padwire",
         eframe::NativeOptions { viewport, ..Default::default() },
         Box::new(move |cc| {
             ui::fonts(&cc.egui_ctx);
-            Ok(Box::new(ui::App::new(app_sh, cfg, path).shot(shot, pick, pad, popup)))
+            Ok(Box::new(ui::App::new(app_sh, cfg, path).shot(shot, pick, pad, popup).check_update(live_run)))
         }),
     );
     sh.quit.store(true, Relaxed);
