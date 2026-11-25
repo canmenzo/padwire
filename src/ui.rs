@@ -24,6 +24,26 @@ const GREEN: Color32 = rgb(0x3ddc84);
 const AMBER: Color32 = rgb(0xffb454);
 const RED: Color32 = rgb(0xff6b6b);
 
+/// The keys bound to a controller button, as short labels: "Q G +1".
+fn keys_on(layout: &model::Layout, t: Target) -> String {
+    let mut caps = model::KEYS.iter().filter(|k| layout.get(k.1).is_some_and(|b| b.to.contains(&t))).map(|k| match k.0 {
+        0x01 => "LMB",
+        0x02 => "RMB",
+        0x04 => "MMB",
+        0x05 => "M4",
+        0x06 => "M5",
+        WHEEL_UP => "Whl\u{2191}",
+        WHEEL_DOWN => "Whl\u{2193}",
+        _ => k.2,
+    });
+    let mut out: Vec<String> = caps.by_ref().take(2).map(str::to_string).collect();
+    let more = caps.count();
+    if more > 0 {
+        out.push(format!("+{more}"));
+    }
+    out.join(" ")
+}
+
 fn color(t: Target, c: Console) -> Color32 {
     use Target::*;
     let ps = c == Console::Ps;
@@ -272,15 +292,30 @@ impl App {
         }
     }
 
-    fn pad_card(&self, cv: &Cv, x: f32, y: f32, st: &Status) {
+    fn pad_card(&self, cv: &Cv, x: f32, y: f32, st: &Status, mode: Mode) {
         use Target::*;
         let (s, p, con) = (cv.s, st.pad, self.cfg.console);
+        let keys = |t: Target| keys_on(self.cfg.layout(mode), t);
         cv.text(cv.r(x + 18.0, y + 14.0, 0.0, 0.0).min, Align2::LEFT_TOP, "Controller", 12.0, DIM);
-        for (i, (sx, sy, click)) in [(p.lx, p.ly, L3), (p.rx, p.ry, R3)].into_iter().enumerate() {
-            let c = cv.r(x + 62.0 + i as f32 * 96.0, y + 92.0, 0.0, 0.0).min;
-            cv.ui.painter().circle_stroke(c, 36.0 * s, Stroke::new(1.0, if p.has(click) { TEXT } else { EDGE }));
-            cv.ui.painter().circle_filled(c + Vec2::new(sx, -sy) * 30.0 * s, 6.0 * s, if sx != 0.0 || sy != 0.0 { TEXT } else { MUTE });
-            cv.text(c + Vec2::new(0.0, 50.0 * s), Align2::CENTER_CENTER, model::button_name(click, con), 11.0, if p.has(click) { TEXT } else { DIM });
+        let sticks = [(p.lx, p.ly, L3, Some([LsUp, LsDown, LsLeft, LsRight])), (p.rx, p.ry, R3, None)];
+        for (i, (sx, sy, click, dirs)) in sticks.into_iter().enumerate() {
+            let c = cv.r(x + 56.0 + i as f32 * 84.0, y + 96.0, 0.0, 0.0).min;
+            cv.ui.painter().circle_stroke(c, 34.0 * s, Stroke::new(1.0, if p.has(click) { TEXT } else { EDGE }));
+            match dirs {
+                Some(dirs) => {
+                    for (t, d) in dirs.into_iter().zip([Vec2::new(0.0, -1.0), Vec2::new(0.0, 1.0), Vec2::new(-1.0, 0.0), Vec2::new(1.0, 0.0)]) {
+                        cv.fit(c + d * 22.0 * s, Align2::CENTER_CENTER, &keys(t), 11.0, 24.0, if p.has(t) { TEXT } else { DIM });
+                    }
+                }
+                None => {
+                    cv.text(c, Align2::CENTER_CENTER, "Mouse", 11.0, DIM);
+                }
+            }
+            if sx != 0.0 || sy != 0.0 {
+                cv.ui.painter().circle_filled(c + Vec2::new(sx, -sy) * 28.0 * s, 5.0 * s, TEXT);
+            }
+            let label = format!("{}  {}", model::button_name(click, con), keys(click));
+            cv.fit(c + Vec2::new(0.0, 52.0 * s), Align2::CENTER_CENTER, label.trim_end(), 11.0, 78.0, if p.has(click) { TEXT } else { DIM });
         }
         let chips: [&[Target]; 4] = [&[L2, L1, R1, R2], &[Triangle, Circle, Cross, Square], &[DUp, DDown, DLeft, DRight], &[Share, Touchpad, Options, Ps]];
         for (ri, row) in chips.iter().enumerate() {
@@ -288,13 +323,14 @@ impl App {
                 if con == Console::Xbox && t == Touchpad {
                     continue;
                 }
-                let r = cv.r(x + 212.0 + ci as f32 * 40.0, y + 40.0 + ri as f32 * 38.0, 36.0, 32.0);
+                let r = cv.r(x + 186.0 + ci as f32 * 67.0, y + 38.0 + ri as f32 * 41.0, 63.0, 37.0);
                 let on = p.has(t) || (t == L2 && p.lt > 0.0) || (t == R2 && p.rt > 0.0);
                 let c = color(t, con);
                 cv.fill(r, 6.0, if on { c } else { KEY });
                 let name = model::button_name(t, con).trim_start_matches("D-pad ");
-                let size = if matches!(t, Cross | Circle | Square | Triangle) && con == Console::Ps { 17.0 } else { 12.0 };
-                cv.fit(r.center(), Align2::CENTER_CENTER, name, size, 32.0, if on { BG } else { c });
+                let size = if matches!(t, Cross | Circle | Square | Triangle) && con == Console::Ps { 13.0 } else { 10.0 };
+                cv.fit(Pos2::new(r.center().x, r.top() + 11.0 * s), Align2::CENTER_CENTER, name, size, 57.0, if on { BG } else { c });
+                cv.fit(Pos2::new(r.center().x, r.bottom() - 11.0 * s), Align2::CENTER_CENTER, &keys(t), 12.0, 57.0, if on { BG } else { TEXT });
             }
         }
     }
@@ -467,13 +503,13 @@ impl App {
         self.keyboard(&cv, mode);
 
         let (cy, ch) = (462.0, 214.0);
-        let cards = [(24.0, 372.0), (412.0, 388.0), (816.0, 340.0)];
+        let cards = [(24.0, 372.0), (412.0, 468.0), (896.0, 260.0)];
         for (x, w) in cards {
             cv.fill(cv.r(x, cy, w, ch), 12.0, PANEL);
         }
         self.aim_card(&cv, cards[0].0, cy, cards[0].1);
         self.apps_card(&cv, cards[2].0, cy, cards[2].1, &st, live);
-        self.pad_card(&cv, cards[1].0, cy, &st);
+        self.pad_card(&cv, cards[1].0, cy, &st, mode);
 
         if let Some(code) = self.pick {
             self.picker(&Cv { ui, o, s, active: true }, code, mode, full);
@@ -660,7 +696,7 @@ mod tests {
         assert!(r.app.adding.is_some(), "+ Add lists the open apps");
         r.app.adding = Some(vec!["chiaki.exe".into(), "obs64.exe".into()]);
         r.frame(vec![]);
-        r.click(900.0, 513.0);
+        r.click(1000.0, 513.0);
         assert_eq!(r.app.cfg.apps.last().unwrap(), "obs64.exe", "apps already listed are not offered again");
         assert_eq!(r.app.sh.want.lock().unwrap().0, r.app.cfg.apps);
         assert_eq!(r.saved().apps, r.app.cfg.apps);
