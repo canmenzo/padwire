@@ -1,6 +1,6 @@
 [package]
 name = "padwire"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Keyboard and mouse as a virtual PlayStation or Xbox controller for Remote Play"
 license = "MIT"

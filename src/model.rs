@@ -6,6 +6,8 @@ pub const WHEEL_UP: u16 = 0x100;
 pub const WHEEL_DOWN: u16 = 0x101;
 pub const CODES: usize = 0x102;
 pub const ARM_VK: u16 = 0x79; // F10
+/// Most keys one controller button can have.
+pub const MAX_KEYS: usize = 2;
 
 /// (code, config name, key cap). Keyboard codes are Windows virtual keys.
 pub const KEYS: &[(u16, &str, &str)] = &[
@@ -36,6 +38,11 @@ pub fn key_code(name: &str) -> Option<u16> {
 
 pub fn key_name(code: u16) -> Option<&'static str> {
     KEYS.iter().find(|k| k.0 == code).map(|k| k.1)
+}
+
+/// Codes of the keys bound to a controller button, in keyboard order.
+pub fn keys_on(l: &Layout, t: Target) -> Vec<u16> {
+    KEYS.iter().filter(|k| l.get(k.1).is_some_and(|b| b.to.contains(&t))).map(|k| k.0).collect()
 }
 
 pub fn key_cap(code: u16) -> &'static str {
@@ -139,7 +146,7 @@ impl Default for Config {
             ("W", &[LsUp]), ("A", &[LsLeft]), ("S", &[LsDown]), ("D", &[LsRight]),
             ("Space", &[Cross]), ("LShift", &[L3]), ("LCtrl", &[Circle]),
             ("F", &[Triangle, Switch]), ("E", &[Triangle]), ("R", &[Square]),
-            ("Q", &[R1]), ("G", &[R1]), ("Tab", &[L1]), ("C", &[R3]), ("V", &[L3, R3]),
+            ("Q", &[R1]), ("Tab", &[L1]), ("V", &[L3, R3]),
             ("M", &[Touchpad]), ("P", &[Options]), ("Enter", &[Options]),
             ("Up", &[DUp]), ("Down", &[DDown]), ("Left", &[DLeft]), ("Right", &[DRight]),
             ("Z", &[DDown]), ("CapsLock", &[Switch]), ("F1", &[Ps]), ("F2", &[Share]),
@@ -148,7 +155,7 @@ impl Default for Config {
         let drive = layout(&[
             ("W", &[R2]), ("S", &[L2]), ("A", &[LsLeft]), ("D", &[LsRight]),
             ("LCtrl", &[LsDown]), ("X", &[LsUp]), ("Space", &[Cross]),
-            ("F", &[Triangle, Switch]), ("E", &[L3]), ("LShift", &[L3]), ("H", &[Circle]),
+            ("F", &[Triangle, Switch]), ("LShift", &[L3]), ("H", &[Circle]),
             ("C", &[R3]), ("V", &[L3, R3]), ("R", &[Square]), ("Q", &[DLeft]), ("Tab", &[L1]),
             ("M", &[Touchpad]), ("P", &[Options]), ("Enter", &[Options]),
             ("Up", &[DUp]), ("Down", &[DDown]), ("Left", &[DLeft]), ("Right", &[DRight]),
@@ -174,6 +181,24 @@ impl Config {
 
     pub fn layout_mut(&mut self, m: Mode) -> &mut Layout {
         if m == Mode::Foot { &mut self.foot } else { &mut self.drive }
+    }
+
+    /// Puts a key (or nothing) in one of a button's key slots. The key's old binding is replaced.
+    pub fn set_key(&mut self, m: Mode, t: Target, slot: usize, code: Option<u16>) {
+        let old = keys_on(self.layout(m), t).get(slot).copied();
+        let l = self.layout_mut(m);
+        if let Some(name) = old.and_then(key_name) {
+            let empty = l.get_mut(name).is_some_and(|b| {
+                b.to.retain(|x| *x != t);
+                b.to.is_empty()
+            });
+            if empty {
+                l.remove(name);
+            }
+        }
+        if let Some(name) = code.and_then(key_name) {
+            l.insert(name.to_string(), Bind { to: vec![t], toggle: false });
+        }
     }
 
     pub fn path() -> PathBuf {
@@ -202,7 +227,15 @@ impl Config {
 
     fn clean(&mut self) {
         for l in [&mut self.foot, &mut self.drive] {
-            l.retain(|k, b| key_code(k).is_some() && !b.to.is_empty());
+            l.retain(|k, _| key_code(k).is_some());
+            for t in TARGETS {
+                for code in keys_on(l, t).into_iter().skip(MAX_KEYS) {
+                    if let Some(b) = key_name(code).and_then(|n| l.get_mut(n)) {
+                        b.to.retain(|x| *x != t);
+                    }
+                }
+            }
+            l.retain(|_, b| !b.to.is_empty());
         }
         self.apps = self.apps.iter().map(|a| a.trim().to_lowercase()).filter(|a| !a.is_empty()).collect();
         self.aim.speed = self.aim.speed.clamp(0.2, 4.0);

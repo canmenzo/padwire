@@ -26,9 +26,13 @@ padwire acts only while it is on and one of the listed apps is in front. While o
 
 ## Rebinding
 
-Click a key, pick one or more buttons. **Press once to hold** turns the key into a toggle (aim, gas).
+**Keyboard** tab: click a key, pick one or more buttons. **Press once to hold** turns the key into a toggle (aim, gas).
 
 ![picker](docs/picker.png)
+
+**Controller** tab: the pad from the front, top and back, with the keys on each button. Click a button, then press the key or mouse button you want on it. A button takes two keys at most.
+
+![controller](docs/controller.png)
 
 Settings are saved to `%APPDATA%\padwire\config.json`.
 

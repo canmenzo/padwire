@@ -15,7 +15,7 @@ fn main() {
     if args.first().is_some_and(|a| a == "--selftest") {
         std::process::exit(selftest::run());
     }
-    // --shot <png> [key] [xbox] [drive] [engine]: render one frame off screen and save it (for checking the UI)
+    // --shot <png> [key] [xbox] [drive] [engine] [pad] [popup]: render one frame off screen and save it (for checking the UI)
     let shot = (args.first().is_some_and(|a| a == "--shot") && args.len() > 1).then(|| PathBuf::from(&args[1]));
     let extra = |s: &str| shot.is_some() && args[2..].iter().any(|a| a == s);
     let path = if shot.is_some() { std::env::temp_dir().join("padwire-shot.json") } else { model::Config::path() };
@@ -28,6 +28,7 @@ fn main() {
     if extra("drive") {
         sh.core.lock().unwrap().flip();
     }
+    let (pad, popup) = (extra("pad"), extra("popup"));
     let engine = (shot.is_none() || extra("engine")).then(|| {
         let sh = sh.clone();
         std::thread::spawn(move || input::run(sh))
@@ -54,7 +55,7 @@ fn main() {
         eframe::NativeOptions { viewport, ..Default::default() },
         Box::new(move |cc| {
             ui::fonts(&cc.egui_ctx);
-            Ok(Box::new(ui::App::new(app_sh, cfg, path).shot(shot, pick)))
+            Ok(Box::new(ui::App::new(app_sh, cfg, path).shot(shot, pick, pad, popup)))
         }),
     );
     sh.quit.store(true, Relaxed);
