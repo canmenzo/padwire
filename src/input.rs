@@ -34,7 +34,7 @@ pub struct Shared {
     pub armed: AtomicBool,
     pub live: AtomicBool,
     pub quit: AtomicBool,
-    /// Self-test: act in any window, handle injected input instead of the real keys and mouse,
+    /// Self-test: act in any window, handle only injected input and let the real keys and mouse through,
     /// leave the cursor alone.
     pub test: AtomicBool,
     pub status: Mutex<Status>,
@@ -158,7 +158,8 @@ unsafe extern "system" fn kb_proc(n: i32, w: WPARAM, l: LPARAM) -> LRESULT {
         {
             let ev = &*(l as *const KBDLLHOOKSTRUCT);
             let test = sh.test.load(Relaxed);
-            if (ev.flags & LLKHF_INJECTED != 0) == test {
+            // self-test: only its own injected events. Otherwise everything, so remote-desktop input (Parsec) counts too.
+            if !test || ev.flags & LLKHF_INJECTED != 0 {
                 let down = w as u32 == WM_KEYDOWN || w as u32 == WM_SYSKEYDOWN;
                 if on_key(sh, ev.vkCode as u16, down, ev.flags & LLKHF_ALTDOWN != 0) {
                     return 1;
@@ -177,7 +178,7 @@ unsafe extern "system" fn ms_proc(n: i32, w: WPARAM, l: LPARAM) -> LRESULT {
         {
             let ev = &*(l as *const MSLLHOOKSTRUCT);
             let test = sh.test.load(Relaxed);
-            if (ev.flags & LLMHF_INJECTED != 0) == test {
+            if !test || ev.flags & LLMHF_INJECTED != 0 {
                 let hi = (ev.mouseData >> 16) as u16;
                 let x = if hi == 1 { 5 } else { 6 };
                 let button = match w as u32 {
