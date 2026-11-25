@@ -98,7 +98,8 @@ pub struct Core {
     mouse: Mouse,
     steer: f32,
     combo_t: f64,
-    switched: f64,
+    /// When and by which key the layout last switched.
+    switched: (f64, u16),
     /// Left stick, right stick, triggers.
     pointed: [Pointed; 3],
 }
@@ -125,7 +126,7 @@ impl Core {
             mouse: Mouse::default(),
             steer: 0.0,
             combo_t: -1.0,
-            switched: -1.0,
+            switched: (-1.0, 0),
             pointed: [Pointed::default(); 3],
         }
     }
@@ -160,11 +161,11 @@ impl Core {
     }
 
     /// A key asked for the other layout. Double-tapping it (bailing out of a car) switches once.
-    fn switch(&mut self, now: f64) {
-        if now - self.switched > RESWITCH {
+    fn switch(&mut self, now: f64, code: u16) {
+        if (now - self.switched.0 > RESWITCH) || code != self.switched.1 {
             self.flip();
+            self.switched = (now, code);
         }
-        self.switched = now;
     }
 
     /// Key or mouse button went down. True = swallow it.
@@ -187,7 +188,7 @@ impl Core {
                 self.latched[c] = !self.latched[c];
             }
             if mask & Target::Switch.bit() != 0 {
-                self.switch(now);
+                self.switch(now, code);
             }
         }
         true
@@ -206,7 +207,7 @@ impl Core {
         }
         self.pulse[!up as usize] = now + PULSE;
         if self.bind(code).is_some_and(|b| b.to.contains(&Target::Switch)) {
-            self.switch(now);
+            self.switch(now, code);
         }
         true
     }
@@ -249,7 +250,6 @@ impl Core {
             let held = t & target.bit() != 0;
             if held && !p.on {
                 *p = Pointed { on: true, since: now, ..Pointed::default() };
-                self.mouse.ev.clear(); // the camera stops, the mouse has another job now
             } else if !held && p.on {
                 p.on = false;
                 p.until = now + LINGER;
@@ -486,6 +486,11 @@ mod tests {
         c.press(F, 5.2);
         assert_eq!(c.mode, Mode::Foot, "bailing out of a car leaves you on foot");
         assert!(c.tick(5.2, 0.001).has(Triangle));
+        c.release(F);
+        c.press(0x14, 5.3); // Caps Lock
+        assert_eq!(c.mode, Mode::Drive, "another key can still correct it at once");
+        c.press(F, 6.0);
+        assert_eq!(c.mode, Mode::Foot, "and F works again after the double-tap window");
     }
 
     #[test]

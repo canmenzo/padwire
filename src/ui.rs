@@ -1141,6 +1141,16 @@ mod tests {
     }
 
     #[test]
+    fn a_mode_is_added_on_top_of_a_key() {
+        let mut cfg = Config::default();
+        let slot = model::keys_on(&cfg.foot, RsHold).len();
+        cfg.set_key(Mode::Foot, RsHold, slot, Some(0x51)); // Q, which is cover
+        assert_eq!(cfg.foot["Q"].to, [R1, RsHold], "Q keeps cover and also hands the stick to the mouse");
+        cfg.set_key(Mode::Foot, Cross, 1, Some(0x51));
+        assert_eq!(cfg.foot["Q"].to, [Cross], "given to a button, a key moves there");
+    }
+
+    #[test]
     fn a_button_takes_two_keys_at_most() {
         let d = Config::default();
         for (name, l) in [("foot", &d.foot), ("drive", &d.drive)] {

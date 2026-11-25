@@ -42,8 +42,8 @@ pub fn check(state: &Arc<Mutex<Update>>) {
     std::thread::spawn(move || {
         let found = match latest() {
             Some(tag) if newer(&tag, VERSION) => Update::Newer(tag),
-            Some(_) => Update::Current,
-            None => Update::Failed,
+            Some(tag) if parse(&tag).is_some() => Update::Current,
+            _ => Update::Failed, // no answer, or a tag that is not a version: do not claim to be up to date
         };
         *state.lock().unwrap() = found;
     });

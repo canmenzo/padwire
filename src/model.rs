@@ -199,7 +199,8 @@ impl Config {
         if m == Mode::Foot { &mut self.foot } else { &mut self.drive }
     }
 
-    /// Puts a key (or nothing) in one of a button's key slots. The key's old binding is replaced.
+    /// Puts a key (or nothing) in one of a button's key slots. A key moves to the button it is given;
+    /// a mode is added on top of what the key already does (Tab opens the wheel and hands over the stick).
     pub fn set_key(&mut self, m: Mode, t: Target, slot: usize, code: Option<u16>) {
         let old = keys_on(self.layout(m), t).get(slot).copied();
         let l = self.layout_mut(m);
@@ -213,7 +214,16 @@ impl Config {
             }
         }
         if let Some(name) = code.and_then(key_name) {
-            l.insert(name.to_string(), Bind { to: vec![t], toggle: false });
+            match l.get_mut(name) {
+                Some(b) if !t.is_button() => {
+                    if !b.to.contains(&t) {
+                        b.to.push(t);
+                    }
+                }
+                _ => {
+                    l.insert(name.to_string(), Bind { to: vec![t], toggle: false });
+                }
+            }
         }
     }
 
