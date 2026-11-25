@@ -6,7 +6,7 @@ use crate::pad::Out;
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::*;
@@ -43,6 +43,15 @@ pub struct Shared {
 static SHARED: OnceLock<Arc<Shared>> = OnceLock::new();
 static ARM_HELD: AtomicBool = AtomicBool::new(false);
 static ARM_OURS: AtomicBool = AtomicBool::new(false);
+/// Auto-reset event the hooks set so the output loop sends at once instead of on its next tick.
+static WAKE: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
+
+fn wake() {
+    let e = WAKE.load(Relaxed);
+    if !e.is_null() {
+        unsafe { SetEvent(e) };
+    }
+}
 
 impl Shared {
     pub fn new(core: Core, apps: Vec<String>, console: Console) -> Arc<Shared> {
@@ -161,7 +170,9 @@ unsafe extern "system" fn kb_proc(n: i32, w: WPARAM, l: LPARAM) -> LRESULT {
             // self-test: only its own injected events. Otherwise everything, so remote-desktop input (Parsec) counts too.
             if !test || ev.flags & LLKHF_INJECTED != 0 {
                 let down = w as u32 == WM_KEYDOWN || w as u32 == WM_SYSKEYDOWN;
-                if on_key(sh, ev.vkCode as u16, down, ev.flags & LLKHF_ALTDOWN != 0) {
+                let swallow = on_key(sh, ev.vkCode as u16, down, ev.flags & LLKHF_ALTDOWN != 0);
+                wake();
+                if swallow {
                     return 1;
                 }
             }
@@ -201,6 +212,7 @@ unsafe extern "system" fn ms_proc(n: i32, w: WPARAM, l: LPARAM) -> LRESULT {
                     None => false,
                 };
                 drop(core);
+                wake();
                 if swallow {
                     return 1;
                 }
@@ -239,6 +251,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
 
 fn hook_thread(ready: mpsc::Sender<u32>) {
     unsafe {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
         let hinst = GetModuleHandleW(null());
         let class = w!("padwire-raw");
         let mut wc: WNDCLASSEXW = zeroed();
@@ -303,7 +316,17 @@ impl Drop for Release {
 
 pub fn run(sh: Arc<Shared>) {
     let _release = Release(sh.clone());
-    unsafe { timeBeginPeriod(1) };
+    unsafe {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+        timeBeginPeriod(1);
+    }
+    // The 1 ms tick must come from a high-resolution waitable timer: a wait timeout follows the system
+    // tick, which Windows 11 may leave at 15.6 ms for a fully covered window despite timeBeginPeriod.
+    let timer = unsafe {
+        CreateWaitableTimerExW(null(), null(), CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS)
+    };
+    let event = unsafe { CreateEventW(null(), 0, 0, null()) };
+    WAKE.store(event, Relaxed);
     let mut out: Option<Out> = None;
     let mut sent: Option<Pad> = None;
     let mut hooks: Option<Hooks> = None;
@@ -371,11 +394,26 @@ pub fn run(sh: Arc<Shared>) {
             }
             sh.status.lock().unwrap().pad = pad;
         }
-        std::thread::sleep(Duration::from_millis(1));
+        if timer.is_null() || event.is_null() {
+            std::thread::sleep(Duration::from_millis(1));
+        } else {
+            unsafe {
+                SetWaitableTimer(timer, &-10_000, 0, None, null(), 0); // 1 ms, relative, in 100 ns units
+                WaitForMultipleObjects(2, [event, timer].as_ptr(), 0, INFINITE);
+            }
+        }
     }
     if let Some(h) = hooks {
         h.stop();
     }
     drop(out);
-    unsafe { timeEndPeriod(1) };
+    WAKE.store(null_mut(), Relaxed);
+    unsafe {
+        for h in [timer, event] {
+            if !h.is_null() {
+                CloseHandle(h);
+            }
+        }
+        timeEndPeriod(1);
+    }
 }

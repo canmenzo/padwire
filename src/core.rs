@@ -21,10 +21,10 @@ impl Pad {
     }
 }
 
-const WINDOW: f64 = 0.024; // mouse counts are averaged over this; shorter flickers between reports
+const WINDOW: f64 = 0.024; // longest mouse averaging window, for a 125 Hz or bursty feed; a fast mouse gets down to a third
 const FULL: f64 = 6000.0; // counts/s that mean full tilt at speed 1
-const GLIDE: f64 = 0.018;
-const STOP: f64 = 0.012;
+const GLIDE: f64 = 0.018; // stick easing at the full window, scaled with it
+const STOP: f64 = 0.012; // the same when the mouse has stopped
 const PULSE: f64 = 0.07; // how long a wheel notch holds its button
 const POINT: f32 = 140.0; // mouse counts from centre to full tilt while the mouse points a stick
 const LINGER: f64 = 0.06; // a pointed stick stays put this long after its key, so a wheel pick lands
@@ -44,6 +44,8 @@ struct Pointed {
 #[derive(Default)]
 struct Mouse {
     ev: VecDeque<(f64, f64, f64)>,
+    /// Averaging window. Kept while the last events drain, so a lone old count does not move the stick again.
+    win: Option<f64>,
     moving: bool,
     sx: f64,
     sy: f64,
@@ -54,17 +56,21 @@ impl Mouse {
         *self = Mouse::default();
     }
 
-    fn target(&mut self, a: &Aim) -> (f64, f64) {
-        let vx = self.ev.iter().map(|e| e.1).sum::<f64>() / WINDOW;
-        let vy = self.ev.iter().map(|e| e.2).sum::<f64>() / WINDOW;
-        let speed = vx.hypot(vy);
+    fn target(&mut self, now: f64, w: f64, a: &Aim) -> (f64, f64) {
         let full = FULL / a.speed.max(0.05) as f64;
-        // start at 3 % of full speed, keep going down to 1 %: a slow hand must not flicker on one line
-        if speed < full * if self.moving { 0.01 } else { 0.03 } {
-            self.moving = false;
+        // start at 3 % of full speed over the whole queue (a twitch must not start the camera), keep going down
+        // to 1 % over the window: a slow hand must not flicker on one line
+        let all = self.ev.iter().map(|e| e.1).sum::<f64>().hypot(self.ev.iter().map(|e| e.2).sum()) / WINDOW;
+        if !self.moving && all < full * 0.03 {
             return (0.0, 0.0);
         }
-        self.moving = true;
+        // the hair off w: a count exactly w old (a feed in step with the loop) is out, not in one tick and out the next
+        let (vx, vy) = self.ev.iter().filter(|e| now - e.0 < w - 1e-6).fold((0.0, 0.0), |(x, y), e| (x + e.1 / w, y + e.2 / w));
+        let speed = vx.hypot(vy);
+        self.moving = speed >= full * 0.01;
+        if !self.moving {
+            return (0.0, 0.0);
+        }
         let push = (a.push as f64).clamp(0.0, 0.9);
         let d = (speed / full).min(1.0).powf(a.curve.max(0.2) as f64);
         let out = (push + (1.0 - push) * d).min(1.0);
@@ -73,11 +79,20 @@ impl Mouse {
 
     /// Stick as (x right, y down), each -1..1.
     fn step(&mut self, now: f64, dt: f64, a: &Aim) -> (f32, f32) {
-        while self.ev.front().is_some_and(|e| now - e.0 >= WINDOW) {
+        while self.ev.front().is_some_and(|e| now - e.0 >= WINDOW - 1e-6) {
             self.ev.pop_front();
         }
-        let (tx, ty) = self.target(a);
-        let k = (-dt / if tx == 0.0 && ty == 0.0 { STOP } else { GLIDE }).exp();
+        // a fast mouse needs no long average: four of its widest gaps between reports will do. Until two report
+        // times are queued the gap is unknown (a remote desktop sends several events at once)
+        if self.ev.is_empty() {
+            self.win = None;
+        } else if self.ev.back().unwrap().0 > self.ev[0].0 {
+            let gap = self.ev.iter().zip(self.ev.range(1..)).map(|(p, e)| e.0 - p.0).fold(0.0, f64::max);
+            self.win = Some((4.0 * gap).clamp(WINDOW / 3.0, WINDOW));
+        }
+        let w = self.win.unwrap_or(WINDOW);
+        let (tx, ty) = self.target(now, w, a);
+        let k = (-dt / (w / WINDOW * if tx == 0.0 && ty == 0.0 { STOP } else { GLIDE })).exp();
         self.sx = self.sx * k + tx * (1.0 - k);
         self.sy = self.sy * k + ty * (1.0 - k);
         if self.sx.abs() < 1.0 / 127.0 && self.sy.abs() < 1.0 / 127.0 {
@@ -98,6 +113,8 @@ pub struct Core {
     mouse: Mouse,
     steer: f32,
     combo_t: f64,
+    /// L3 and R3 as the last tick sent them.
+    clicks: u32,
     /// When and by which key the layout last switched.
     switched: (f64, u16),
     /// Left stick, right stick, triggers.
@@ -126,6 +143,7 @@ impl Core {
             mouse: Mouse::default(),
             steer: 0.0,
             combo_t: -1.0,
+            clicks: 0,
             switched: (-1.0, 0),
             pointed: [Pointed::default(); 3],
         }
@@ -144,6 +162,7 @@ impl Core {
         self.pulse = [0.0; 2];
         self.mouse.reset();
         self.steer = 0.0;
+        self.clicks = 0;
         self.pointed = [Pointed::default(); 3];
     }
 
@@ -181,7 +200,7 @@ impl Core {
         self.held[c] = true;
         if let Some(b) = self.bind(code) {
             let (mask, toggle) = (b.mask(), b.toggle);
-            if mask & Target::L3.bit() != 0 && mask & Target::R3.bit() != 0 {
+            if mask & Target::L3.bit() != 0 && mask & Target::R3.bit() != 0 && self.clicks != 0 {
                 self.combo_t = now;
             }
             if toggle {
@@ -245,6 +264,7 @@ impl Core {
             // both stick clicks: let go first (Shift may hold L3), then press them together
             t &= !(Target::L3.bit() | Target::R3.bit());
         }
+        self.clicks = t & (Target::L3.bit() | Target::R3.bit());
         let on = |x: Target| (t & x.bit() != 0) as i32 as f32;
         for (p, target) in self.pointed.iter_mut().zip([Target::LsHold, Target::RsHold, Target::Triggers]) {
             let held = t & target.bit() != 0;
@@ -265,7 +285,8 @@ impl Core {
         }
         if self.mode == Mode::Drive {
             // a key is all or nothing: ease the wheel over so A/D steer like a thumb
-            let turning_in = lx != 0.0 && (lx.abs() > self.steer.abs() || lx * self.steer < 0.0);
+            // a reversal unwinds at the letting-go rate until it crosses the middle
+            let turning_in = lx != 0.0 && lx * self.steer >= 0.0 && lx.abs() > self.steer.abs();
             let rate = if turning_in { 5.0 } else { 9.0 } * dt as f32;
             self.steer += (lx - self.steer).clamp(-rate, rate);
             if lx != 0.0 && self.steer.abs() < 0.3 {
@@ -409,6 +430,14 @@ mod tests {
     }
 
     #[test]
+    fn stick_clicks_alone_go_down_at_once() {
+        let mut c = core();
+        c.press(V, 0.0);
+        let p = c.tick(0.0, 0.001);
+        assert!(p.has(L3) && p.has(R3), "nothing to let go of, so no gap");
+    }
+
+    #[test]
     fn keys_on_the_right_stick_beat_the_mouse() {
         let mut cfg = Config::default();
         cfg.foot.insert("U".into(), Bind { to: vec![LsDown, RsDown], toggle: false });
@@ -523,6 +552,21 @@ mod tests {
         assert_eq!(lx, 0.0);
     }
 
+    #[test]
+    fn steering_swaps_sides_quickly() {
+        let mut c = core();
+        c.flip();
+        c.press(D, 0.0);
+        let mut i = 0;
+        while c.tick(i as f64 * 0.001, 0.001).lx < 1.0 {
+            i += 1;
+        }
+        c.release(D);
+        c.press(A, i as f64 * 0.001);
+        let crossed = (1..200).find(|k| c.tick((i + k) as f64 * 0.001, 0.001).lx < 0.0).unwrap();
+        assert!(crossed <= 90, "full right to left of centre took {crossed} ms");
+    }
+
     /// Feeds a 1000 Hz mouse moving `cps` counts/s for `secs`, returns the stick at the end.
     fn swipe(c: &mut Core, cps: f64, secs: f64, t0: f64) -> Pad {
         let mut p = Pad::default();
@@ -538,6 +582,67 @@ mod tests {
             p = c.tick(now, 0.001);
         }
         p
+    }
+
+    /// Ticks at 1 kHz; `ev[i]` holds the counts that arrive in ms `i`, one `mouse_move` each, half a ms before
+    /// the tick as they land live. Returns rx per tick.
+    fn feed(c: &mut Core, ev: &[Vec<i32>]) -> Vec<f32> {
+        let mut out = Vec::new();
+        for (i, counts) in ev.iter().enumerate() {
+            let now = i as f64 * 0.001;
+            for &dx in counts {
+                c.mouse_move(now - 0.0005, dx, 0);
+            }
+            out.push(c.tick(now, 0.001).rx);
+        }
+        out
+    }
+
+    /// 4000 counts/s delivered as remote desktop does: 4 events at once, every 8 to 16 ms. Returns the feed and the last burst.
+    fn bursts() -> (Vec<Vec<i32>>, usize) {
+        let mut ev = vec![vec![]; 400];
+        let (mut t, mut last) = (0, 0);
+        for g in [8, 13, 16, 10, 12, 9, 15, 11].into_iter().cycle() {
+            t += g;
+            if t >= 380 {
+                return (ev, last);
+            }
+            ev[t] = vec![g as i32; 4];
+            last = t;
+        }
+        unreachable!()
+    }
+
+    // rx max minus min over the steady part of these feeds, measured with the fixed 24 ms window
+    const RIPPLE_125HZ: f32 = 0.003252;
+    const RIPPLE_BURSTS: f32 = 0.09912;
+
+    /// Over a steady swipe the stick never drops to 0 and wobbles no more than `bound`.
+    fn assert_steady(rx: &[f32], bound: f32) {
+        let (lo, hi) = rx.iter().fold((f32::MAX, f32::MIN), |(lo, hi), &x| (lo.min(x), hi.max(x)));
+        assert!(lo > 0.0, "the stick dropped to 0 mid-swipe");
+        assert!(hi - lo <= bound, "ripple {} is over {bound}, what the fixed 24 ms window gave", hi - lo);
+    }
+
+    #[test]
+    fn a_fast_mouse_turns_the_camera_at_once() {
+        let mut ev = vec![vec![6]; 300];
+        ev.resize(400, vec![]);
+        let rx = feed(&mut core(), &ev);
+        assert!(rx[19] > 0.9, "near full tilt within 20 ms of the first count, got {}", rx[19]);
+        assert!(rx[338..].iter().all(|&x| x == 0.0), "at rest within 40 ms of the last count");
+    }
+
+    #[test]
+    fn a_125hz_mouse_holds_the_camera_steady() {
+        let ev: Vec<_> = (0..400).map(|i| if i % 8 == 0 && i < 380 { vec![24] } else { vec![] }).collect();
+        assert_steady(&feed(&mut core(), &ev)[100..376], RIPPLE_125HZ);
+    }
+
+    #[test]
+    fn remote_desktop_bursts_hold_the_camera_steady() {
+        let (ev, last) = bursts();
+        assert_steady(&feed(&mut core(), &ev)[100..last], RIPPLE_BURSTS);
     }
 
     #[test]

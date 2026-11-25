@@ -161,6 +161,61 @@ fn press_reads(read: &dyn Fn() -> bool, vk: u16) -> bool {
     down && until(500, || !read())
 }
 
+/// How long a key press and a mouse move take to reach XInput, through the hooks, the engine and the driver.
+fn latency(t: &mut T, slot: u32, vk: u16) {
+    let pad = || xinput(slot).unwrap_or(unsafe { zeroed() });
+    let a = || pad().wButtons & XINPUT_GAMEPAD_A != 0;
+    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+    // busy-waits (no sleep) for `f` until `limit` ms after `from`, returning the time since `from`
+    let spin = |from: Instant, limit: u64, f: &dyn Fn() -> bool| {
+        while from.elapsed() < Duration::from_millis(limit) {
+            if f() {
+                return Some(from.elapsed());
+            }
+        }
+        None
+    };
+
+    let mut lat = Vec::new();
+    for i in 0..200u64 {
+        // 0 to 2 ms lead-in so presses do not line up with the output loop's phase
+        let lead = Duration::from_micros(i * 7919 % 2000);
+        let s = Instant::now();
+        while s.elapsed() < lead {}
+        let t0 = Instant::now();
+        key(vk, true);
+        let got = spin(t0, 500, &a);
+        key(vk, false);
+        spin(Instant::now(), 500, &|| !a());
+        lat.extend(got);
+    }
+    lat.sort();
+    let worst = lat.last().copied().unwrap_or(Duration::MAX);
+    if !lat.is_empty() {
+        println!("     key latency: median {:.2} ms, worst {:.2} ms ({} of 200 presses read)", ms(lat[lat.len() / 2]), ms(worst), lat.len());
+    }
+    t.check(lat.len() == 200 && worst < Duration::from_millis(20), "key latency: every press reads within 20 ms");
+
+    let t0 = Instant::now();
+    let (mut next, mut last, mut rise) = (t0, t0, None);
+    while t0.elapsed() < Duration::from_millis(100) {
+        if Instant::now() >= next {
+            last = Instant::now();
+            mouse(6, MOUSEEVENTF_MOVE, 0);
+            next += Duration::from_millis(1);
+        }
+        if rise.is_none() && pad().sThumbRX > 16384 {
+            rise = Some(t0.elapsed());
+        }
+    }
+    let rise = rise.or_else(|| spin(t0, 400, &|| pad().sThumbRX > 16384));
+    let rest = spin(last, 500, &|| pad().sThumbRX == 0);
+    let show = |d: Option<Duration>| d.map_or("never".to_string(), |d| format!("{:.2} ms", ms(d)));
+    // Windows hands injected moves over in 8 ms lumps, so this is the 125 Hz path, not a fast mouse
+    println!("     camera latency at 125 Hz: first move to RX > 16384 {}, last move to rest {}", show(rise), show(rest));
+    t.check(rise.is_some() && rest.is_some(), "camera: steady mouse motion tilts the right stick and it settles at rest");
+}
+
 /// Keyboard and mouse through the hooks, the engine and the driver.
 fn chain(t: &mut T) {
     const F24: u16 = 0x87;
@@ -195,6 +250,7 @@ fn chain(t: &mut T) {
         t.check(live, "turning on goes live");
         if live {
             t.check(press_reads(&a, F24), "keyboard hook: key down presses the button, key up lets go");
+            latency(t, slot, F24);
 
             let rt = || pad().bRightTrigger == 255;
             mouse(0, MOUSEEVENTF_LEFTDOWN, 0);
